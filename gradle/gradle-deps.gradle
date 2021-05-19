@@ -1,0 +1,17 @@
+apply from: 'gradle/deps-version.gradle'
+
+def dependencies = [:]
+
+dependencies.gradle = [:] // gradle dependencies
+dependencies.gradle.buildscript = [:] // gradle build script dependencies
+dependencies.gradle.android = [:] // android gradle dependencies
+
+dependencies.module = [:] // android module dependencies
+dependencies.module.android = [:]
+
+ext.deps = dependencies
+
+dependencies.gradle.buildscript.gradle = "com.android.tools.build:gradle:$android_gradle_plugin"
+dependencies.gradle.buildscript.kotlin_gradle = "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_gradle_plugin"
+
+dependencies.module.kotlin_stdlib = "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_stdlib"
