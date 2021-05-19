@@ -1,17 +1,23 @@
 apply from: 'gradle/deps-version.gradle'
 
 def dependencies = [:]
-
 dependencies.gradle = [:] // gradle dependencies
 dependencies.gradle.buildscript = [:] // gradle build script dependencies
-dependencies.gradle.android = [:] // android gradle dependencies
-
 dependencies.module = [:] // android module dependencies
-dependencies.module.android = [:]
-
+dependencies.module.test = [:]
 ext.deps = dependencies
 
-dependencies.gradle.buildscript.gradle = "com.android.tools.build:gradle:$android_gradle_plugin"
-dependencies.gradle.buildscript.kotlin_gradle = "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_gradle_plugin"
+dependencies.gradle.buildscript.gradle = "com.android.tools.build:gradle:$build_versions.android_gradle_plugin"
+dependencies.gradle.buildscript.kotlin_gradle = "org.jetbrains.kotlin:kotlin-gradle-plugin:$build_versions.kotlin_gradle_plugin"
 
-dependencies.module.kotlin_stdlib = "org.jetbrains.kotlin:kotlin-stdlib:$kotlin_stdlib"
+//module dependencies
+dependencies.module.kotlin_stdlib = "org.jetbrains.kotlin:kotlin-stdlib:$module_versions.kotlin_stdlib"
+dependencies.module.annotations = "androidx.annotation:annotation:$module_versions.annotations"
+dependencies.module.appcompat = "androidx.appcompat:appcompat:$module_versions.appcompat"
+dependencies.module.core_ktx = "androidx.core:core-ktx:$module_versions.core_ktx"
+dependencies.module.constraint_layout = "androidx.constraintlayout:constraintlayout:$module_versions.constraint_layout"
+dependencies.module.material = "com.google.android.material:material:$module_versions.material"
+//module test dependencies
+dependencies.module.test.junit = "junit:junit:$module_versions.junit"
+dependencies.module.test.android_junit = "androidx.test.ext:junit:$module_versions.android_junit"
+dependencies.module.test.espresso = "androidx.test.espresso:espresso-core:$module_versions.espresso"

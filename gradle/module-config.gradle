@@ -1,12 +1,12 @@
 apply from : "${rootDir}/gradle/deps-version.gradle"
 
 android {
-    compileSdkVersion build_versions.compile_sdk
-    buildToolsVersion build_versions.build_tools
+    compileSdkVersion android_versions.compile_sdk
+    buildToolsVersion android_versions.build_tools
 
     defaultConfig {
-        minSdkVersion build_versions.min_sdk
-        targetSdkVersion build_versions.target_sdk
+        minSdkVersion android_versions.min_sdk
+        targetSdkVersion android_versions.target_sdk
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
