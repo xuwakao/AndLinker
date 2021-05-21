@@ -1,18 +1,15 @@
-# For more information about using CMake with Android Studio, read the
-# documentation: https://d.android.com/studio/projects/add-native-code.html
-
-# Sets the minimum version of CMake required to build the native library.
-
 cmake_minimum_required(VERSION 3.10.2)
+add_compile_options(
+        -std=c++14
+#        -Weverything
+#        -Werror
+)
 
-project("andlinker")
 
-add_library(native-lib
-             SHARED
-             native-lib.cpp )
+file(GLOB ADL_SRC *.cpp)
 
-find_library(log-lib
-              log )
+add_library(adl SHARED ${ADL_SRC})
 
-target_link_libraries( native-lib
-                       ${log-lib} )
+target_include_directories(adl PUBLIC include .)
+
+target_link_libraries(adl log)

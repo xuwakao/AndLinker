@@ -9,12 +9,6 @@ android {
     defaultConfig {
         versionCode 1
         versionName "1.0"
-
-        externalNativeBuild {
-            cmake {
-                cppFlags "-std=c++14"
-            }
-        }
     }
 
     buildTypes {
@@ -26,7 +20,7 @@ android {
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
-            version "3.10.2"
+            version rootProject.ext.module_versions.cmake
         }
     }
 }
