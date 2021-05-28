@@ -37,6 +37,11 @@
 #define ADL_USE_RELA 1
 #endif
 
+
+constexpr ElfW(Versym) ADL_kVersymNotNeeded = 0;
+constexpr ElfW(Versym) ADL_kVersymGlobal = 1;
+
+
 #define ADL_LINKER_DLOPEN_SYM "__loader_dlopen"
 
 __BEGIN_DECLS

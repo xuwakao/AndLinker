@@ -9,6 +9,7 @@
 
 __BEGIN_DECLS
 
+static constexpr ElfW(Versym) ADL_kVersymHiddenBit = 0x8000;
 
 typedef struct symbol_name {
     uint32_t elf_hash();
@@ -22,14 +23,27 @@ typedef struct symbol_name {
     uint32_t gnu_hash_;
 } adl_symbol;
 
+typedef struct version_info {
+    constexpr version_info() : elf_hash(0), name(NULL) {}
+
+    uint32_t elf_hash;
+    const char *name;
+} adl_version_info;
+
+typedef struct tls_segment {
+    size_t size = 0;
+    size_t alignment = 1;
+    const void *init_ptr = "";    // Field is non-null even when init_size is 0.
+    size_t init_size = 0;
+} adl_tls_segment;
+
 typedef struct so_info {
     char *filename;
     ElfW(Addr) load_bias;
     ElfW(Addr) base;
     const ElfW(Phdr) *phdr;
     ElfW(Half) phnum;
-
-    bool prelink;
+    uint32_t flags_;
 
     ElfW(Dyn) *dynamic;
 
@@ -56,6 +70,14 @@ typedef struct so_info {
     size_t rel_count_;
 #endif
 
+#if !defined(__LP64__)
+    bool has_text_relocations;
+#endif
+    bool has_DT_SYMBOLIC;
+
+    adl_tls_segment *tls_segment;
+
+    // version >= 2
     size_t gnu_nbucket_;
     uint32_t *gnu_bucket_;
     uint32_t *gnu_chain_;
@@ -67,17 +89,17 @@ typedef struct so_info {
     uint8_t *android_relocs_;
     size_t android_relocs_size_;
 
-    uint32_t flags_;
+    const ElfW(Versym) *versym_;
+
+    ElfW(Addr) verdef_ptr_;
+    size_t verdef_cnt_;
+
+    ElfW(Addr) verneed_ptr_;
+    size_t verneed_cnt_;
 
     // version >= 4
     ElfW(Relr) *relr_;
     size_t relr_count_;
-
-#if !defined(__LP64__)
-    bool has_text_relocations;
-#endif
-    bool has_DT_SYMBOLIC;
-
 
     bool is_gnu_hash() const;
 } adl_so_info;
@@ -138,6 +160,37 @@ static inline bool adl_is_symbol_global_and_defined(const adl_so_info *si, const
     return false;
 }
 
+
+//TODO : force ADL_kVersymNotNeeded
+ElfW(Versym) adl_find_verdef_version_index(const adl_so_info *si, const version_info *vi) {
+    return ADL_kVersymNotNeeded;
+//    if (vi == nullptr) {
+//        return ADL_kVersymNotNeeded;
+//    }
+//
+//    ElfW(Versym) result = ADL_kVersymGlobal;
+//    return result;
+}
+
+// Check whether a requested version matches the version on a symbol definition. There are a few
+// special cases:
+//  - If the defining DSO has no version info at all, then any version matches.
+//  - If no version is requested (vi==nullptr, verneed==kVersymNotNeeded), then any non-hidden
+//    version matches.
+//  - If the requested version is not defined by the DSO, then verneed is kVersymGlobal, and only
+//    global symbol definitions match. (This special case is handled as part of the ordinary case
+//    where the version must match exactly.)
+// TODO : Not checked
+static inline bool check_symbol_version(const ElfW(Versym) *ver_table, uint32_t sym_idx,
+                                        const ElfW(Versym) verneed) {
+    return true;
+//    if (ver_table == nullptr) return true;
+//    const uint32_t verdef = ver_table[sym_idx];
+//    return (verneed == ADL_kVersymNotNeeded) ?
+//           !(verdef & ADL_kVersymHiddenBit) :
+//           verneed == (verdef & ~ADL_kVersymHiddenBit);
+}
+
 /* Returns the size of the extent of all the possibly non-contiguous
  * loadable segments in an ELF program header table. This corresponds
  * to the page-aligned size in bytes that needs to be reserved in the
@@ -185,6 +238,49 @@ static size_t adl_phdr_table_get_load_size(const ElfW(Phdr) *phdr_table, size_t 
         *out_max_vaddr = max_vaddr;
     }
     return max_vaddr - min_vaddr;
+}
+
+static ElfW(Addr) resolve_symbol_address(const adl_so_info *soInfo, const ElfW(Sym) *s) {
+    if (ELF_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
+        //TODO : ifunc handle
+//        return call_ifunc_resolver(s->st_value + soInfo->load_bias);
+        return 0;
+    }
+
+    return static_cast<ElfW(Addr)>(s->st_value + soInfo->load_bias);
+}
+
+// Search for a TLS segment in the given phdr table. Returns true if it has a
+// TLS segment and false otherwise.
+static bool adl_get_tls_segment(const ElfW(Phdr) *phdr_table, size_t phdr_count,
+                                ElfW(Addr) load_bias, adl_tls_segment *out) {
+    for (size_t i = 0; i < phdr_count; ++i) {
+        const ElfW(Phdr) &phdr = phdr_table[i];
+        if (phdr.p_type == PT_TLS) {
+            *out = adl_tls_segment{
+                    phdr.p_memsz,
+                    phdr.p_align,
+                    reinterpret_cast<void *>(load_bias + phdr.p_vaddr),
+                    phdr.p_filesz,
+            };
+            return true;
+        }
+    }
+    return false;
+}
+
+// Return true if the alignment of a TLS segment is a valid power-of-two. Also
+// cap the alignment if it's too high.
+bool adl_check_tls_alignment(size_t *alignment) {
+    // N.B. The size does not need to be a multiple of the alignment. With
+    // ld.bfd (or after using binutils' strip), the TLS segment's size isn't
+    // rounded up.
+    if (*alignment == 0 || !powerof2(*alignment)) {
+        return false;
+    }
+    // Bionic only respects TLS alignment up to one page.
+    *alignment = MIN(*alignment, PAGE_SIZE);
+    return true;
 }
 
 
@@ -287,6 +383,14 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                                        &soInfo->dynamic, &dynamic_flags);
     if (soInfo->dynamic == NULL) {
         return -1;
+    }
+
+    adl_tls_segment tls_segment;
+    if (adl_get_tls_segment(soInfo->phdr, soInfo->phnum, soInfo->load_bias, &tls_segment)) {
+        if (!adl_check_tls_alignment(&tls_segment.alignment)) {
+            return false;
+        }
+        soInfo->tls_segment = &tls_segment;
     }
 
     // Extract useful information from dynamic section.
@@ -505,6 +609,24 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                     soInfo->has_DT_SYMBOLIC = true;
                 }
                 break;
+            case DT_VERSYM:
+                soInfo->versym_ = reinterpret_cast<ElfW(Versym) *>(load_bias + d->d_un.d_ptr);
+                break;
+
+            case DT_VERDEF:
+                soInfo->verdef_ptr_ = load_bias + d->d_un.d_ptr;
+                break;
+            case DT_VERDEFNUM:
+                soInfo->verdef_cnt_ = d->d_un.d_val;
+                break;
+
+            case DT_VERNEED:
+                soInfo->verneed_ptr_ = load_bias + d->d_un.d_ptr;
+                break;
+
+            case DT_VERNEEDNUM:
+                soInfo->verneed_cnt_ = d->d_un.d_val;
+                break;
             default:
                 break;
         }
@@ -528,7 +650,8 @@ static int adl_prelink_image(adl_so_info *soInfo) {
     return 0;
 }
 
-static ElfW(Sym) *adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name) {
+static ElfW(Sym) *
+adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
     const uint32_t hash = symbol_name.gnu_hash();
 
     constexpr uint32_t kBloomMaskBits = sizeof(ElfW(Addr)) * 8;
@@ -558,9 +681,13 @@ static ElfW(Sym) *adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name) {
         return NULL;
     }
 
+    const ElfW(Versym) verneed = adl_find_verdef_version_index(soInfo, vi);
+    const ElfW(Versym) *versym = soInfo->versym_;
+
     do {
         ElfW(Sym) *s = soInfo->symtab_ + n;
         if (((soInfo->gnu_chain_[n] ^ hash) >> 1) == 0 &&
+            check_symbol_version(versym, n, verneed) &&
             strcmp(soInfo->strtab_ + s->st_name, symbol_name.name_) == 0 &&
             adl_is_symbol_global_and_defined(soInfo, s)) {
             ADLOGW("FOUND %s in %s (%p) %zd",
@@ -576,17 +703,22 @@ static ElfW(Sym) *adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name) {
     return NULL;
 }
 
-static ElfW(Sym) *adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name) {
+static ElfW(Sym) *
+adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
     uint32_t hash = symbol_name.elf_hash();
 
     ADLOGW("SEARCH %s in %s@%p h=%x(elf) %zd",
            symbol_name.name_, soInfo->filename,
            reinterpret_cast<void *>(soInfo->base), hash, hash % soInfo->nbucket_);
 
+    const ElfW(Versym) verneed = adl_find_verdef_version_index(soInfo, vi);
+    const ElfW(Versym) *versym = soInfo->versym_;
+
     for (uint32_t n = soInfo->bucket_[hash % soInfo->nbucket_]; n != 0; n = soInfo->chain_[n]) {
         ElfW(Sym) *s = soInfo->symtab_ + n;
 
-        if (strcmp(soInfo->strtab_ + s->st_name, symbol_name.name_) == 0 &&
+        if (check_symbol_version(versym, n, verneed) &&
+            strcmp(soInfo->strtab_ + s->st_name, symbol_name.name_) == 0 &&
             adl_is_symbol_global_and_defined(soInfo, s)) {
             ADLOGI("FOUND %s in %s (%p) %zd",
                    symbol_name.name_, soInfo->filename,
@@ -603,20 +735,82 @@ static ElfW(Sym) *adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name) {
     return NULL;
 }
 
-void *adlsym(void *handle, const char *symbol) {
-    if (NULL == handle || NULL == symbol) return NULL;
 
-    adl_so_info *soInfo = (adl_so_info *) handle;
+static const ElfW(Sym) *adlsym_handle_lookup(adl_so_info *soInfo,
+                                             adl_symbol &symbol_name,
+                                             const adl_version_info *vi) {
     if (adl_prelink_image(soInfo) < 0)
         return NULL;
 
-    adl_symbol adlSymbol;
-    adlSymbol.name_ = symbol;
-    ElfW(Sym) *sym = soInfo->is_gnu_hash() ?
-                     adl_gnu_lookup(soInfo, adlSymbol) : adl_elf_lookup(soInfo, adlSymbol);
+    return soInfo->is_gnu_hash() ?
+           adl_gnu_lookup(soInfo, symbol_name, vi) : adl_elf_lookup(soInfo, symbol_name, vi);
+}
 
-    if (NULL == sym) return NULL;
-    return (void *) (soInfo->load_bias + sym->st_value);
+bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void **symbol) {
+    if (NULL == handle || NULL == symbol) return NULL;
+
+    const ElfW(Sym) *sym = NULL;
+
+    adl_so_info *soInfo = (adl_so_info *) handle;
+
+    adl_version_info vi_instance;
+    adl_version_info *vi = NULL;
+
+    if (sym_ver != NULL) {
+        vi_instance.name = sym_ver;
+        vi_instance.elf_hash = calculate_elf_hash(sym_ver);
+        vi = &vi_instance;
+    }
+
+    adl_symbol adlSymbol;
+    adlSymbol.name_ = sym_name;
+    sym = adlsym_handle_lookup(soInfo, adlSymbol, vi);
+    if (sym != NULL) {
+        uint32_t bind = ELF_ST_BIND(sym->st_info);
+        uint32_t type = ELF_ST_TYPE(sym->st_info);
+
+        if (/*(bind == STB_GLOBAL || bind == STB_WEAK) &&*/ sym->st_shndx != 0) {
+            if (type == STT_TLS) {
+                // For a TLS symbol, dlsym returns the address of the current thread's
+                // copy of the symbol.
+                const adl_tls_segment *tls_module = soInfo->tls_segment;
+                if (tls_module == NULL) {
+                    ADLOGE("TLS symbol \"%s\" in solib \"%s\" with no TLS segment",
+                           sym_name, soInfo->filename);
+                    return false;
+                }
+
+                //TODO : get tls block
+//                void* tls_block = get_tls_block_for_this_thread(tls_module, /*should_alloc=*/true);
+//                *symbol = static_cast<char*>(tls_block) + sym->st_value;
+                return false;
+            } else {
+                *symbol = reinterpret_cast<void *>(resolve_symbol_address(soInfo, sym));
+            }
+            ADLOGW("... dlsym successful: sym_name=\"%s\", sym_ver=\"%s\", found in=\"%s\", address=%p",
+                   sym_name, sym_ver, soInfo->filename, *symbol);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void *adlsym(void *handle, const char *symbol) {
+    void *result;
+    if (!adl_do_dlsym(handle, symbol, NULL, &result)) {
+        return NULL;
+    }
+    return result;
+}
+
+void *adlvsym(void *handle, const char *symbol,
+              const char *version) {
+    void *result;
+    if (!adl_do_dlsym(handle, symbol, version, &result)) {
+        return NULL;
+    }
+    return result;
 }
 
 int adl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *args),
@@ -637,14 +831,13 @@ void *adlopen(const char *filename, int flag) {
     if (level >= __ANDROID_API_O_MR1__) {
         adl_so_info *soInfo = adl_find_library(filename);
         if (soInfo != NULL) {
-            ADLOGI("elf [%s] is found at : [0x%llx,0x%llx,%d]", soInfo->filename, soInfo->load_bias,
+            ADLOGI("elf [%s] is found at : [0x%llx,0x%llx,%d]", soInfo->filename,
+                   soInfo->load_bias,
                    soInfo->base, soInfo->phdr->p_vaddr);
             return soInfo;
         } else {
             ADLOGW("elf [%s] NOT found.", filename);
         }
-
-
     }
     return NULL;
 }
