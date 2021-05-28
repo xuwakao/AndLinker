@@ -6,10 +6,10 @@
 
 __BEGIN_DECLS
 
-extern __attribute((weak)) int dl_iterate_phdr(int (*)(struct dl_phdr_info *, size_t, void *), void *);
+extern __attribute((weak)) int
+dl_iterate_phdr(int (*)(struct dl_phdr_info *, size_t, void *), void *);
 
-int do_adl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *data),
-                        void *data) {
+int adl_do_iterate_phdr(adl_iterate_phdr_cb callback, void *data) {
     return dl_iterate_phdr(callback, data);
 }
 

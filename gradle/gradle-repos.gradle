@@ -1,6 +1,7 @@
 def repos(RepositoryHandler handler) {
     handler.maven { url = "https://maven.aliyun.com/repository/google" }
     handler.maven { url = "https://maven.aliyun.com/repository/jcenter" }
+    handler.mavenCentral()
 }
 
 ext.repos = this.&repos

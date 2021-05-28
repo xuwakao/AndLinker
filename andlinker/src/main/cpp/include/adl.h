@@ -30,6 +30,7 @@ void *adlvsym(void *__handle,
 int adladdr(const void *__addr, Dl_info *__info);
 
 //link.h
+typedef int (*adl_iterate_phdr_cb)(struct dl_phdr_info *info, size_t size, void *arg);
 int adl_iterate_phdr(int (*__callback)(struct dl_phdr_info *, size_t, void *), void *__data);
 
 __END_DECLS

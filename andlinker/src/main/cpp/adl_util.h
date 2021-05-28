@@ -11,6 +11,7 @@
 #include <android/api-level.h>
 #include <sys/stat.h>
 #include <string.h>
+#include <link.h>
 
 #define TAG "adl"
 #define ADLOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
@@ -27,6 +28,16 @@
 // Returns the address of the next page after address 'x', unless 'x' is
 // itself at the start of a page.
 #define PAGE_END(x) PAGE_START((x) + (PAGE_SIZE-1))
+
+#define ADL_FLAG_GNU_HASH         0x00000040 // uses gnu hash
+#define ADL_FLAG_PRELINKED        0x00000400 // prelink_image has successfully processed this soinfo
+
+// Android uses RELA for LP64.
+#if defined(__LP64__)
+#define ADL_USE_RELA 1
+#endif
+
+#define ADL_LINKER_DLOPEN_SYM "__loader_dlopen"
 
 __BEGIN_DECLS
 

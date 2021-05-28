@@ -7,10 +7,11 @@
 
 #include <sys/cdefs.h>
 #include <stdint.h>
+#include "adl.h"
 
 __BEGIN_DECLS
 
-int do_adl_iterate_phdr(int (*__callback)(struct dl_phdr_info*, size_t, void*), void* __data);
+int adl_do_iterate_phdr(adl_iterate_phdr_cb callback, void *__data);
 
 __END_DECLS
 
