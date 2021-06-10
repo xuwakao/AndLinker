@@ -7,7 +7,7 @@
 
 #include <link.h>
 #include <dlfcn.h>
-#include <stdint.h>
+#include <unistd.h>
 
 /**
  * adl.h define exported APIs that are similar to those defined in <dlfcn.h> and <link.h>
@@ -31,7 +31,7 @@ int adladdr(const void *__addr, Dl_info *__info);
 
 //link.h
 typedef int (*adl_iterate_phdr_cb)(struct dl_phdr_info *info, size_t size, void *arg);
-int adl_iterate_phdr(int (*__callback)(struct dl_phdr_info *, size_t, void *), void *__data);
+int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *), void *__data);
 
 __END_DECLS
 

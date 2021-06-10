@@ -1,26 +1,29 @@
 #include <jni.h>
 #include <malloc.h>
 #include <sys/param.h>
+#include <fcntl.h>
 
 #include "adl.h"
 #include "adl_util.h"
 #include "adl_linker.h"
 #include "adl_linker_phdr.h"
+#include "adl_loader.h"
+#include "adl_elf_reader.h"
 
 __BEGIN_DECLS
 
 static constexpr ElfW(Versym) ADL_kVersymHiddenBit = 0x8000;
 
 typedef struct symbol_name {
-    uint32_t elf_hash();
+    uint32_t elf_hash(void);
 
-    uint32_t gnu_hash();
+    void gnu_hash(uint32_t *hash);
 
     const char *name_;
     bool has_elf_hash_;
     bool has_gnu_hash_;
     uint32_t elf_hash_;
-    uint32_t gnu_hash_;
+    uint32_t gnu_hash_[2];
 } adl_symbol;
 
 typedef struct version_info {
@@ -30,7 +33,7 @@ typedef struct version_info {
     const char *name;
 } adl_version_info;
 
-typedef struct tls_segment {
+typedef struct {
     size_t size = 0;
     size_t alignment = 1;
     const void *init_ptr = "";    // Field is non-null even when init_size is 0.
@@ -38,12 +41,14 @@ typedef struct tls_segment {
 } adl_tls_segment;
 
 typedef struct so_info {
-    char *filename;
-    ElfW(Addr) load_bias;
-    ElfW(Addr) base;
+    void *dlopen_handle;
+    void *elf_reader;
+
+    const char *filename;
+    ElfW(Addr) base;//mmap load start
     const ElfW(Phdr) *phdr;
     ElfW(Half) phnum;
-    uint32_t flags_;
+    uint32_t flags_ = ADL_FLAG_NEW_SOINFO;
 
     ElfW(Dyn) *dynamic;
 
@@ -69,6 +74,10 @@ typedef struct so_info {
     ElfW(Rel) *rel_;
     size_t rel_count_;
 #endif
+
+    // When you read a virtual address from the ELF file, add this
+    // value to get the corresponding address in the process' address space.
+    ElfW(Addr) load_bias;
 
 #if !defined(__LP64__)
     bool has_text_relocations;
@@ -101,12 +110,47 @@ typedef struct so_info {
     ElfW(Relr) *relr_;
     size_t relr_count_;
 
-    bool is_gnu_hash() const;
+    bool is_gnu_hash(void) const;
+
+    ElfW(Addr) get_verneed_ptr(void) const;
+
+    size_t get_verneed_cnt(void) const;
+
+    ElfW(Addr) get_verdef_ptr(void) const;
+
+    size_t get_verdef_cnt(void) const;
+
+    const char *get_string(ElfW(Word) index) const;
 } adl_so_info;
 
-bool adl_so_info::is_gnu_hash() const {
+bool so_info::is_gnu_hash(void) const {
     return (flags_ & ADL_FLAG_GNU_HASH) != 0;
 }
+
+ElfW(Addr) so_info::get_verneed_ptr(void) const {
+    return verneed_ptr_;
+}
+
+size_t so_info::get_verneed_cnt(void) const {
+    return verneed_cnt_;
+}
+
+ElfW(Addr) so_info::get_verdef_ptr(void) const {
+    return verdef_ptr_;
+}
+
+size_t so_info::get_verdef_cnt(void) const {
+    return verdef_cnt_;
+}
+
+const char *so_info::get_string(ElfW(Word) index) const {
+    if (index >= strtab_size_) {
+        return NULL;
+    }
+
+    return strtab_ + index;
+}
+
 
 static uint32_t calculate_elf_hash(const char *name) {
     const uint8_t *name_bytes = reinterpret_cast<const uint8_t *>(name);
@@ -122,7 +166,7 @@ static uint32_t calculate_elf_hash(const char *name) {
     return h;
 }
 
-uint32_t adl_symbol::elf_hash() {
+uint32_t symbol_name::elf_hash(void) {
     if (!has_elf_hash_) {
         elf_hash_ = calculate_elf_hash(name_);
         has_elf_hash_ = true;
@@ -131,22 +175,23 @@ uint32_t adl_symbol::elf_hash() {
     return elf_hash_;
 }
 
-static uint32_t calculate_gnu_hash_simple(const char *name) {
+static void calculate_gnu_hash_simple(const char *name, uint32_t *hash) {
     uint32_t h = 5381;
     const uint8_t *name_bytes = reinterpret_cast<const uint8_t *>(name);
     while (*name_bytes != 0) {
         h += (h << 5) + *name_bytes++; // h*33 + c = h + h * 32 + c = h + h << 5 + c
     }
-    return h;
+    hash[0] = h;
+    hash[1] = reinterpret_cast<const char *>(name_bytes) - name;
 }
 
-uint32_t adl_symbol::gnu_hash() {
+void symbol_name::gnu_hash(uint32_t *hash) {
     if (!has_gnu_hash_) {
-        gnu_hash_ = calculate_gnu_hash_simple(name_);
+        calculate_gnu_hash_simple(name_, gnu_hash_);
         has_gnu_hash_ = true;
     }
-
-    return gnu_hash_;
+    hash[0] = gnu_hash_[0];
+    hash[1] = gnu_hash_[1];
 }
 
 static inline bool adl_is_symbol_global_and_defined(const adl_so_info *si, const ElfW(Sym) *s) {
@@ -161,21 +206,89 @@ static inline bool adl_is_symbol_global_and_defined(const adl_so_info *si, const
 }
 
 
-//TODO : force ADL_kVersymNotNeeded
+typedef bool (*loop_verdef_filter)(const adl_so_info *si, const version_info *vi,
+                                   size_t, const ElfW(Verdef) *verdef,
+                                   const ElfW(Verdaux) *verdaux,
+                                   ElfW(Versym) *result);
+static bool adl_for_each_verdef(const adl_so_info *si, const version_info *vi,
+                                ElfW(Versym) *result, loop_verdef_filter filter) {
+    uintptr_t verdef_ptr = si->get_verdef_ptr();
+    if (verdef_ptr == 0) {
+        return true;
+    }
+
+    size_t offset = 0;
+
+    size_t verdef_cnt = si->get_verdef_cnt();
+    for (size_t i = 0; i < verdef_cnt; ++i) {
+        const ElfW(Verdef) *verdef = reinterpret_cast<ElfW(Verdef) *>(verdef_ptr + offset);
+        size_t verdaux_offset = offset + verdef->vd_aux;
+        offset += verdef->vd_next;
+
+        if (verdef->vd_version != 1) {
+            ADLOGE("unsupported verdef[%zd] vd_version: %d (expected 1) library: %s",
+                   i, verdef->vd_version, si->filename);
+            return false;
+        }
+
+        if ((verdef->vd_flags & VER_FLG_BASE) != 0) {
+            // "this is the version of the file itself.  It must not be used for
+            //  matching a symbol. It can be used to match references."
+            //
+            // http://www.akkadia.org/drepper/symbol-versioning
+            continue;
+        }
+
+        if (verdef->vd_cnt == 0) {
+            ADLOGE("invalid verdef[%zd] vd_cnt == 0 (version without a name)", i);
+            return false;
+        }
+
+        const ElfW(Verdaux) *verdaux = reinterpret_cast<ElfW(Verdaux) *>(verdef_ptr +
+                                                                         verdaux_offset);
+
+        if (filter(si, vi, i, verdef, verdaux, result) == true) {
+            break;
+        }
+    }
+
+    return true;
+}
+
+static bool
+adl_loop_verdef_filter(const adl_so_info *si, const adl_version_info *vi, size_t,
+                       const ElfW(Verdef) *verdef, const ElfW(Verdaux) *verdaux,
+                       ElfW(Versym) *result) {
+    if (verdef->vd_hash == vi->elf_hash &&
+        strcmp(vi->name, si->get_string(verdaux->vda_name)) == 0) {
+        *result = verdef->vd_ndx;
+        return true;
+    }
+
+    return false;
+}
+
+
 ElfW(Versym) adl_find_verdef_version_index(const adl_so_info *si, const version_info *vi) {
-    return ADL_kVersymNotNeeded;
-//    if (vi == nullptr) {
-//        return ADL_kVersymNotNeeded;
-//    }
-//
-//    ElfW(Versym) result = ADL_kVersymGlobal;
-//    return result;
+    if (vi == NULL) {
+        return ADL_kVersymNotNeeded;
+    }
+
+    ElfW(Versym) result = ADL_kVersymGlobal;
+    if (!adl_for_each_verdef(si, vi, &result, adl_loop_verdef_filter)) {
+        // verdef should have already been validated in prelink_image.
+        ADLOGE("invalid verdef after prelinking: %s",
+               si->filename);
+        return ADL_kVersymNotNeeded;
+    }
+
+    return result;
 }
 
 // Check whether a requested version matches the version on a symbol definition. There are a few
 // special cases:
 //  - If the defining DSO has no version info at all, then any version matches.
-//  - If no version is requested (vi==nullptr, verneed==kVersymNotNeeded), then any non-hidden
+//  - If no version is requested (vi==NULL, verneed==kVersymNotNeeded), then any non-hidden
 //    version matches.
 //  - If the requested version is not defined by the DSO, then verneed is kVersymGlobal, and only
 //    global symbol definitions match. (This special case is handled as part of the ordinary case
@@ -184,7 +297,7 @@ ElfW(Versym) adl_find_verdef_version_index(const adl_so_info *si, const version_
 static inline bool check_symbol_version(const ElfW(Versym) *ver_table, uint32_t sym_idx,
                                         const ElfW(Versym) verneed) {
     return true;
-//    if (ver_table == nullptr) return true;
+//    if (ver_table == NULL) return true;
 //    const uint32_t verdef = ver_table[sym_idx];
 //    return (verneed == ADL_kVersymNotNeeded) ?
 //           !(verdef & ADL_kVersymHiddenBit) :
@@ -305,13 +418,14 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
         return 0;
     }
 
+    ADLOGI("+++ adl_iterate_phdr_callback(%s)", info->dlpi_name);
     if (info->dlpi_addr == 0) {
-        ADLOGW("adl_iterate_phdr_callback dlpi_addr is invalid.");
+        ADLOGW("dlpi_addr is invalid.");
         return 0;
     }
 
     if ('/' != info->dlpi_name[0] && '[' != info->dlpi_name[0]) {
-        ADLOGW("ELF %s is loaded without full path name ", info->dlpi_name);
+        ADLOGW("Loaded without full path name.");
     }
 
     /**
@@ -330,9 +444,11 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
     uintptr_t *it_args = (uintptr_t *) data;
     adl_iterate_phdr_cb callback = reinterpret_cast<adl_iterate_phdr_cb>(*it_args++);
     void *org_arg = reinterpret_cast<void *>(*it_args++);
-    ADLOGI("ELF[2] %s dl_phdr_info dlpi_phdr = 0x%llx , dlpi_phnum %d , dlpi_addr = 0x%llx",
-           info->dlpi_name, info->dlpi_phdr, info->dlpi_phnum, info->dlpi_addr);
-    return callback(info, size, org_arg);
+    ADLOGI(">>> dlpi_phdr = 0x%llx , dlpi_phnum %d , dlpi_addr = 0x%llx",
+           info->dlpi_phdr, info->dlpi_phnum, info->dlpi_addr);
+    int result = callback(info, size, org_arg);
+    ADLOGI("+++ --------------------------------------");
+    return result;
 }
 
 static int adl_find_library_callback(struct dl_phdr_info *info, size_t size, void *data) {
@@ -373,7 +489,6 @@ static adl_so_info *adl_find_library(const char *filename) {
     adl_iterate_phdr(adl_find_library_callback, args);
     return soInfo;
 }
-
 
 static int adl_prelink_image(adl_so_info *soInfo) {
     if (soInfo->flags_ & ADL_FLAG_PRELINKED) return 0;
@@ -650,60 +765,77 @@ static int adl_prelink_image(adl_so_info *soInfo) {
     return 0;
 }
 
-static ElfW(Sym) *
+static const ElfW(Sym) *
 adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
-    const uint32_t hash = symbol_name.gnu_hash();
+    const uint32_t name_hash_len[] = {0, 0};
+    symbol_name.gnu_hash(const_cast<uint32_t *>(name_hash_len));
+    const uint32_t name_hash = name_hash_len[0];
+    const uint32_t name_len = name_hash_len[1];
 
     constexpr uint32_t kBloomMaskBits = sizeof(ElfW(Addr)) * 8;
-    const uint32_t word_num = (hash / kBloomMaskBits) & soInfo->gnu_maskwords_;
+
+    ADLOGD("SEARCH %s in %s@%p (gnu), gnu_bloom_filter_(%p)",
+           symbol_name.name_, soInfo->filename,
+           reinterpret_cast<void *>(soInfo->base), soInfo->gnu_bloom_filter_);
+
+    const uint32_t word_num = (name_hash / kBloomMaskBits) & soInfo->gnu_maskwords_;
     const ElfW(Addr) bloom_word = soInfo->gnu_bloom_filter_[word_num];
-    const uint32_t h1 = hash % kBloomMaskBits;
-    const uint32_t h2 = (hash >> soInfo->gnu_shift2_) % kBloomMaskBits;
+    const uint32_t h1 = name_hash % kBloomMaskBits;
+    const uint32_t h2 = (name_hash >> soInfo->gnu_shift2_) % kBloomMaskBits;
 
-    ADLOGD("SEARCH %s in %s@%p (gnu)",
-           symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
-
-    // test against bloom filter
     if ((1 & (bloom_word >> h1) & (bloom_word >> h2)) == 0) {
-        ADLOGW("NOT FOUND %s in %s@%p",
+        ADLOGW("NOT FOUND[0] %s in %s@%p",
                symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
-
         return NULL;
     }
 
-    // bloom test says "probably yes"...
-    uint32_t n = soInfo->gnu_bucket_[hash % soInfo->gnu_nbucket_];
-
-    if (n == 0) {
-        ADLOGW("NOT FOUND %s in %s@%p",
+    uint32_t sym_idx = soInfo->gnu_bucket_[name_hash % soInfo->gnu_nbucket_];
+    if (sym_idx == 0) {
+        ADLOGW("NOT FOUND[1] %s in %s@%p",
                symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
-
         return NULL;
     }
 
-    const ElfW(Versym) verneed = adl_find_verdef_version_index(soInfo, vi);
-    const ElfW(Versym) *versym = soInfo->versym_;
+    // Search the library's hash table chain.
+    ElfW(Versym) verneed = ADL_kVersymNotNeeded;
+    bool calculated_verneed = false;
 
+    uint32_t chain_value = 0;
+    const ElfW(Sym) *sym = NULL;
     do {
-        ElfW(Sym) *s = soInfo->symtab_ + n;
-        if (((soInfo->gnu_chain_[n] ^ hash) >> 1) == 0 &&
-            check_symbol_version(versym, n, verneed) &&
-            strcmp(soInfo->strtab_ + s->st_name, symbol_name.name_) == 0 &&
-            adl_is_symbol_global_and_defined(soInfo, s)) {
-            ADLOGW("FOUND %s in %s (%p) %zd",
-                   symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(s->st_value),
-                   static_cast<size_t>(s->st_size));
-            return soInfo->symtab_ + n;
-        }
-    } while ((soInfo->gnu_chain_[n++] & 1) == 0);
+        sym = soInfo->symtab_ + sym_idx;
+        chain_value = soInfo->gnu_chain_[sym_idx];
+        ADLOGI("FINDING 0x%llx, 0x%llx, 0x%llx", chain_value, name_hash, sym_idx);
+        if ((chain_value >> 1) == (name_hash >> 1)) {
+            if (vi != NULL && !calculated_verneed) {
+                calculated_verneed = true;
+                verneed = adl_find_verdef_version_index(soInfo, vi);
+            }
 
-    ADLOGW("NOT FOUND %s in %s@%p",
+            ADLOGI("FINDING [%s == %s] in %s (%p) %zd",
+                   symbol_name.name_, soInfo->strtab_ + sym->st_name, soInfo->filename,
+                   reinterpret_cast<void *>(sym->st_value),
+                   static_cast<size_t>(sym->st_size));
+            if (check_symbol_version(soInfo->versym_, sym_idx, verneed) &&
+                static_cast<size_t>(sym->st_name) + name_len + 1 <= soInfo->strtab_size_ &&
+                memcmp(soInfo->strtab_ + sym->st_name, symbol_name.name_, name_len + 1) == 0 &&
+                adl_is_symbol_global_and_defined(soInfo, sym)) {
+                ADLOGI("FOUND %s in %s (%p) %zd",
+                       symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(sym->st_value),
+                       static_cast<size_t>(sym->st_size));
+                return sym;
+            }
+        }
+        ++sym_idx;
+    } while ((chain_value & 1) == 0);
+
+    ADLOGW("NOT FOUND[2] %s in %s@%p",
            symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
 
     return NULL;
 }
 
-static ElfW(Sym) *
+static const ElfW(Sym) *
 adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
     uint32_t hash = symbol_name.elf_hash();
 
@@ -735,6 +867,112 @@ adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
     return NULL;
 }
 
+static bool adl_verify_elf_header(adl_so_info *soInfo, const ElfW(Ehdr) *header) {
+    if (memcmp(header->e_ident, ELFMAG, SELFMAG) != 0) {
+        ADLOGE("\"%s\" has bad ELF magic: %02x%02x%02x%02x", soInfo->filename,
+               header->e_ident[0], header->e_ident[1], header->e_ident[2], header->e_ident[3]);
+        return false;
+    }
+
+    if (header->e_ident[EI_DATA] != ELFDATA2LSB) {
+        ADLOGE("\"%s\" not little-endian: %d", soInfo->filename, header->e_ident[EI_DATA]);
+        return false;
+    }
+
+    if (header->e_type != ET_DYN) {
+        ADLOGE("\"%s\" has unexpected e_type: %d", soInfo->filename, header->e_type);
+        return false;
+    }
+
+    if (header->e_version != EV_CURRENT) {
+        ADLOGE("\"%s\" has unexpected e_version: %d", soInfo->filename, header->e_version);
+        return false;
+    }
+
+    if (header->e_shentsize != sizeof(ElfW(Shdr))) {
+        // Fail if app is targeting Android O or above
+        if (adl_get_api_level() >= 26) {
+            ADLOGE("\"%s\" has unsupported e_shentsize: 0x%x (expected 0x%zx)",
+                   soInfo->filename, header->e_shentsize, sizeof(ElfW(Shdr)));
+            return false;
+        }
+        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
+               "\"%s\" has unsupported e_shentsize 0x%x (expected 0x%zx)",
+               soInfo->filename, header->e_shentsize, sizeof(ElfW(Shdr)));
+        ADLOGW(soInfo->filename, "has invalid ELF header");
+    }
+
+    if (header->e_shstrndx == 0) {
+        // Fail if app is targeting Android O or above
+        if (adl_get_api_level() >= 26) {
+            ADLOGE("\"%s\" has invalid e_shstrndx", soInfo->filename);
+            return false;
+        }
+
+        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
+               "\"%s\" has invalid e_shstrndx", soInfo->filename);
+        ADLOGW(soInfo->filename, "has invalid ELF header");
+    }
+    return true;
+}
+
+//MAYBE elf header is inside the first loadable segment in some case.(No PT_PHDR and
+// first loadable segment p_offset == 0)
+static const ElfW(Sym) *
+adl_symtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
+                  const version_info *vi) {
+    if (soInfo->filename[0] != '/') {
+        ADLOGW("library path is not full path : %s", soInfo->filename);
+        return NULL;
+    }
+
+    if (soInfo->elf_reader == NULL) {
+        ElfW(Ehdr) *elfHdr = reinterpret_cast<ElfW(Ehdr) *>(soInfo->base);
+        adl_elf_reader *reader = static_cast<adl_elf_reader *>(
+                calloc(1, sizeof(adl_elf_reader)));
+        reader->fd_ = -1;
+        reader->name_ = soInfo->filename;
+        reader->header_ = elfHdr;
+        reader->phdr_table_ = soInfo->phdr;
+        reader->dynamic_ = soInfo->dynamic;
+        soInfo->elf_reader = reader;
+    }
+
+    adl_elf_reader *elf_reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
+
+    if (!elf_reader->verify_elf_header()) {
+        ADLOGW("adl_so_info base address is not ELF header, try to load from file.");
+        if (!elf_reader->read_elf_header(true)) {
+            ADLOGE("read elf header failed.");
+            return NULL;
+        }
+    } else {
+        ADLOGI("adl_so_info base address is already ELF header");
+    }
+
+    if (!elf_reader->read_program_headers() ||
+        !elf_reader->read_section_headers() ||
+        !elf_reader->read_other_section()) {
+        ADLOGE("read elf(%s) information failed .", soInfo->filename);
+        return NULL;
+    }
+
+    for (size_t i = 0; i < elf_reader->shdr_symtab_num_; i++) {
+        const ElfW(Sym) *sym = &elf_reader->shdr_symtab_[i];
+        //check not special section/reserved indices
+        //See : https://docs.oracle.com/cd/E23824_01/html/819-0690/chapter6-94076.html
+        if (sym->st_shndx == SHN_UNDEF ||
+            (sym->st_shndx >= SHN_LORESERVE && sym->st_shndx <= SHN_HIRESERVE)) {
+            continue;
+        }
+
+        const char *symbol = &elf_reader->strtab_[sym->st_name];
+        if (strcmp(symbol, symbol_name.name_) == 0)
+            return reinterpret_cast<const ElfW(Sym) *>(
+                    soInfo->load_bias + sym->st_value);
+    }
+    return NULL;
+}
 
 static const ElfW(Sym) *adlsym_handle_lookup(adl_so_info *soInfo,
                                              adl_symbol &symbol_name,
@@ -742,12 +980,18 @@ static const ElfW(Sym) *adlsym_handle_lookup(adl_so_info *soInfo,
     if (adl_prelink_image(soInfo) < 0)
         return NULL;
 
-    return soInfo->is_gnu_hash() ?
-           adl_gnu_lookup(soInfo, symbol_name, vi) : adl_elf_lookup(soInfo, symbol_name, vi);
+    const ElfW(Sym) *symbol;
+    if (soInfo->is_gnu_hash())
+        symbol = adl_gnu_lookup(soInfo, symbol_name, vi);
+    if (symbol == NULL && soInfo->bucket_ != NULL)
+        symbol = adl_elf_lookup(soInfo, symbol_name, vi);
+    if (symbol == NULL)
+        symbol = adl_symtab_lookup(soInfo, symbol_name, vi);
+    return symbol;
 }
 
 bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void **symbol) {
-    if (NULL == handle || NULL == symbol) return NULL;
+    if (NULL == handle || NULL == symbol) return false;
 
     const ElfW(Sym) *sym = NULL;
 
@@ -785,7 +1029,10 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
 //                *symbol = static_cast<char*>(tls_block) + sym->st_value;
                 return false;
             } else {
-                *symbol = reinterpret_cast<void *>(resolve_symbol_address(soInfo, sym));
+                ElfW(Addr) resolved_addr = resolve_symbol_address(soInfo, sym);
+                if (resolved_addr == 0)
+                    return false;
+                *symbol = reinterpret_cast<void *>(resolved_addr);
             }
             ADLOGW("... dlsym successful: sym_name=\"%s\", sym_ver=\"%s\", found in=\"%s\", address=%p",
                    sym_name, sym_ver, soInfo->filename, *symbol);
@@ -813,33 +1060,60 @@ void *adlvsym(void *handle, const char *symbol,
     return result;
 }
 
-int adl_iterate_phdr(int (*callback)(struct dl_phdr_info *info, size_t size, void *args),
-                     void *args) {
-    if (callback == NULL) return 0;
+int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *),
+                     void *__data) {
+    if (__callback == NULL) return 0;
 
-    uintptr_t it_args[] = {reinterpret_cast<uintptr_t>(callback),
-                           reinterpret_cast<uintptr_t>(args)};
+    uintptr_t it_args[2] = {reinterpret_cast<uintptr_t>(__callback),
+                            reinterpret_cast<uintptr_t>(__data)};
     return adl_do_iterate_phdr(adl_iterate_phdr_callback, it_args);
 }
 
 void *adlopen(const char *filename, int flag) {
-    if (filename == NULL || !adl_file_exists(filename)) {
-        ADLOGW("adlopen file not exist");
+    if (filename == NULL ||
+        (filename[0] == '/' && !adl_file_exists(filename))) {
+        ADLOGW("adlopen(%s) file not exist", filename);
         return NULL;
     }
     int level = adl_get_api_level();
     if (level >= __ANDROID_API_O_MR1__) {
         adl_so_info *soInfo = adl_find_library(filename);
         if (soInfo != NULL) {
-            ADLOGI("elf [%s] is found at : [0x%llx,0x%llx,%d]", soInfo->filename,
+            ADLOGI("adlopen Elf(%s) is found at : [0x%llx,0x%llx,%d]", soInfo->filename,
                    soInfo->load_bias,
                    soInfo->base, soInfo->phdr->p_vaddr);
             return soInfo;
         } else {
-            ADLOGW("elf [%s] NOT found.", filename);
+            void *dlopen_handle = adl_load(filename);
+            if (dlopen_handle == NULL) {
+                ADLOGW("adlopen Elf(%s) not loaded", filename);
+                return NULL;
+            }
+            soInfo = adl_find_library(filename);
+            if (soInfo == NULL) {
+                ADLOGW("adlopen Elf(%s) not loaded again", filename);
+                dlclose(dlopen_handle);
+                return NULL;
+            }
+            ADLOGI("adlopen Elf(%s) is loaded at : [0x%llx,0x%llx,%d]", soInfo->filename,
+                   soInfo->load_bias,
+                   soInfo->base, soInfo->phdr->p_vaddr);
+            soInfo->dlopen_handle = dlopen_handle;
+            return (void *) soInfo;
         }
     }
     return NULL;
+}
+
+int adlclose(void *handle) {
+    if (NULL == handle) return -1;
+
+    adl_so_info *soInfo = (adl_so_info *) handle;
+    if (NULL != soInfo->filename)
+        free((void *) soInfo->filename);
+    void *dlopen_handle = soInfo->dlopen_handle;
+    free(soInfo);
+    return dlclose(dlopen_handle);
 }
 
 __END_DECLS
