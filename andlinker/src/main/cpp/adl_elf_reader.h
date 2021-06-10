@@ -26,6 +26,7 @@ typedef struct map_file_fragment {
 
 typedef struct elf_reader {
     const char *name_;
+    const char *real_path_;
     int fd_;
     off64_t file_offset_;
     off64_t file_size_;

@@ -353,7 +353,8 @@ static size_t adl_phdr_table_get_load_size(const ElfW(Phdr) *phdr_table, size_t 
     return max_vaddr - min_vaddr;
 }
 
-static ElfW(Addr) resolve_symbol_address(const adl_so_info *soInfo, const ElfW(Sym) *s) {
+static ElfW(Addr) resolve_symbol_address(const adl_so_info *soInfo,
+                                         const ElfW(Sym) *s) {
     if (ELF_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
         //TODO : ifunc handle
 //        return call_ifunc_resolver(s->st_value + soInfo->load_bias);
@@ -784,14 +785,14 @@ adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
     const uint32_t h2 = (name_hash >> soInfo->gnu_shift2_) % kBloomMaskBits;
 
     if ((1 & (bloom_word >> h1) & (bloom_word >> h2)) == 0) {
-        ADLOGW("NOT FOUND[0] %s in %s@%p",
+        ADLOGW("NOT FOUND[gnu_hash] bloom filter %s in %s@%p",
                symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
         return NULL;
     }
 
     uint32_t sym_idx = soInfo->gnu_bucket_[name_hash % soInfo->gnu_nbucket_];
     if (sym_idx == 0) {
-        ADLOGW("NOT FOUND[1] %s in %s@%p",
+        ADLOGW("NOT FOUND[gnu_hash] index %s in %s@%p",
                symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
         return NULL;
     }
@@ -805,22 +806,22 @@ adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
     do {
         sym = soInfo->symtab_ + sym_idx;
         chain_value = soInfo->gnu_chain_[sym_idx];
-        ADLOGI("FINDING 0x%llx, 0x%llx, 0x%llx", chain_value, name_hash, sym_idx);
+//        ADLOGI("FINDING 0x%llx, 0x%llx, 0x%llx", chain_value, name_hash, sym_idx);
         if ((chain_value >> 1) == (name_hash >> 1)) {
             if (vi != NULL && !calculated_verneed) {
                 calculated_verneed = true;
                 verneed = adl_find_verdef_version_index(soInfo, vi);
             }
 
-            ADLOGI("FINDING [%s == %s] in %s (%p) %zd",
-                   symbol_name.name_, soInfo->strtab_ + sym->st_name, soInfo->filename,
-                   reinterpret_cast<void *>(sym->st_value),
-                   static_cast<size_t>(sym->st_size));
+//            ADLOGI("FINDING [%s == %s] in %s (%p) %zd",
+//                   symbol_name.name_, soInfo->strtab_ + sym->st_name, soInfo->filename,
+//                   reinterpret_cast<void *>(sym->st_value),
+//                   static_cast<size_t>(sym->st_size));
             if (check_symbol_version(soInfo->versym_, sym_idx, verneed) &&
                 static_cast<size_t>(sym->st_name) + name_len + 1 <= soInfo->strtab_size_ &&
                 memcmp(soInfo->strtab_ + sym->st_name, symbol_name.name_, name_len + 1) == 0 &&
                 adl_is_symbol_global_and_defined(soInfo, sym)) {
-                ADLOGI("FOUND %s in %s (%p) %zd",
+                ADLOGI("FOUND[gnu_hash] %s in %s (%p) %zd",
                        symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(sym->st_value),
                        static_cast<size_t>(sym->st_size));
                 return sym;
@@ -829,7 +830,7 @@ adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
         ++sym_idx;
     } while ((chain_value & 1) == 0);
 
-    ADLOGW("NOT FOUND[2] %s in %s@%p",
+    ADLOGW("NOT FOUND[gnu_hash] %s in %s@%p",
            symbol_name.name_, soInfo->filename, reinterpret_cast<void *>(soInfo->base));
 
     return NULL;
@@ -852,7 +853,7 @@ adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
         if (check_symbol_version(versym, n, verneed) &&
             strcmp(soInfo->strtab_ + s->st_name, symbol_name.name_) == 0 &&
             adl_is_symbol_global_and_defined(soInfo, s)) {
-            ADLOGI("FOUND %s in %s (%p) %zd",
+            ADLOGI("FOUND[hash] %s in %s (%p) %zd",
                    symbol_name.name_, soInfo->filename,
                    reinterpret_cast<void *>(s->st_value),
                    static_cast<size_t>(s->st_size));
@@ -860,60 +861,11 @@ adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
         }
     }
 
-    ADLOGW("NOT FOUND %s in %s@%p %x %zd",
+    ADLOGW("NOT FOUND[hash] %s in %s@%p %x %zd",
            symbol_name.name_, soInfo->filename,
            reinterpret_cast<void *>(soInfo->base), hash, hash % soInfo->nbucket_);
 
     return NULL;
-}
-
-static bool adl_verify_elf_header(adl_so_info *soInfo, const ElfW(Ehdr) *header) {
-    if (memcmp(header->e_ident, ELFMAG, SELFMAG) != 0) {
-        ADLOGE("\"%s\" has bad ELF magic: %02x%02x%02x%02x", soInfo->filename,
-               header->e_ident[0], header->e_ident[1], header->e_ident[2], header->e_ident[3]);
-        return false;
-    }
-
-    if (header->e_ident[EI_DATA] != ELFDATA2LSB) {
-        ADLOGE("\"%s\" not little-endian: %d", soInfo->filename, header->e_ident[EI_DATA]);
-        return false;
-    }
-
-    if (header->e_type != ET_DYN) {
-        ADLOGE("\"%s\" has unexpected e_type: %d", soInfo->filename, header->e_type);
-        return false;
-    }
-
-    if (header->e_version != EV_CURRENT) {
-        ADLOGE("\"%s\" has unexpected e_version: %d", soInfo->filename, header->e_version);
-        return false;
-    }
-
-    if (header->e_shentsize != sizeof(ElfW(Shdr))) {
-        // Fail if app is targeting Android O or above
-        if (adl_get_api_level() >= 26) {
-            ADLOGE("\"%s\" has unsupported e_shentsize: 0x%x (expected 0x%zx)",
-                   soInfo->filename, header->e_shentsize, sizeof(ElfW(Shdr)));
-            return false;
-        }
-        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
-               "\"%s\" has unsupported e_shentsize 0x%x (expected 0x%zx)",
-               soInfo->filename, header->e_shentsize, sizeof(ElfW(Shdr)));
-        ADLOGW(soInfo->filename, "has invalid ELF header");
-    }
-
-    if (header->e_shstrndx == 0) {
-        // Fail if app is targeting Android O or above
-        if (adl_get_api_level() >= 26) {
-            ADLOGE("\"%s\" has invalid e_shstrndx", soInfo->filename);
-            return false;
-        }
-
-        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
-               "\"%s\" has invalid e_shstrndx", soInfo->filename);
-        ADLOGW(soInfo->filename, "has invalid ELF header");
-    }
-    return true;
 }
 
 //MAYBE elf header is inside the first loadable segment in some case.(No PT_PHDR and
@@ -967,9 +919,13 @@ adl_symtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
         }
 
         const char *symbol = &elf_reader->strtab_[sym->st_name];
-        if (strcmp(symbol, symbol_name.name_) == 0)
-            return reinterpret_cast<const ElfW(Sym) *>(
-                    soInfo->load_bias + sym->st_value);
+        if (strcmp(symbol, symbol_name.name_) == 0) {
+            ADLOGI("FOUND[strtab] %s in %s (%p) %zd",
+                   symbol_name.name_, soInfo->filename,
+                   reinterpret_cast<void *>(sym->st_value),
+                   static_cast<size_t>(sym->st_size));
+            return sym;
+        }
     }
     return NULL;
 }

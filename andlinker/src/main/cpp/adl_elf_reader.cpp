@@ -304,23 +304,35 @@ __END_DECLS
 void elf_reader::recycle(void) {
     if (phdr_fragment_ != NULL) {
         phdr_fragment_->unmap();
+        phdr_table_ = NULL;
     }
 
     if (shdr_fragment_ != NULL) {
         shdr_fragment_->unmap();
+        shdr_table_ = NULL;
     }
 
     if (shstrtab_fragment_ != NULL) {
         shstrtab_fragment_->unmap();
+        shstrtab_ = NULL;
     }
 
     if (symtab_fragment_ != NULL) {
         symtab_fragment_->unmap();
+        shdr_symtab_ = NULL;
     }
 
     if (strtab_fragment_ != NULL) {
         strtab_fragment_->unmap();
+        strtab_ = NULL;
     }
+
+    if (fd_ != 1) {
+        close(fd_);
+        fd_ = -1;
+    }
+    free((void *) real_path_);
+    real_path_ = NULL;
 }
 
 bool elf_reader::openFile(void) {
@@ -333,7 +345,7 @@ bool elf_reader::openFile(void) {
         ADLOGE("open or get real path failed : %d, %s", fd, name_);
         return false;
     } else {
-        ADLOGI("open file(%s), get real path : %s", name_, path);
+//        ADLOGI("open file(%s), get real path : %s", name_, path);
     }
 
     struct stat file_stat;
@@ -342,9 +354,10 @@ bool elf_reader::openFile(void) {
         return false;
     }
 
-    ADLOGI("open file(%s) success[%d , %s, %d]", name_, fd, path, file_stat.st_size);
     fd_ = fd;
-    name_ = path;
+    real_path_ = path;
     file_size_ = file_stat.st_size;
+//    ADLOGI("open file(%s) success[%d , %s, %d]",
+//           name_, fd_, real_path_, file_size_);
     return true;
 }
