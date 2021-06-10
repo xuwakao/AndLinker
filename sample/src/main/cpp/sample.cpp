@@ -75,7 +75,7 @@ static void adl_test(JNIEnv *env, jobject thiz) {
     (void) env;
     (void) thiz;
 
-//    adl_test_iterate();
+    adl_test_iterate();
 
     // linker
     //inner symbol
@@ -93,11 +93,11 @@ static void adl_test(JNIEnv *env, jobject thiz) {
     adl_test_dlsym(BASENAME_LIBCPP, "_ZNSt3__18valarrayImEC2Em", false);
     adl_test_dlsym(PATHNAME_LIBCPP, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE3putEc", false);
 
-    void *linker_handle_libcurl = adl_test_dlsym(PATHNAME_LIBCURL, "Curl_open", true);
-    if (NULL != linker_handle_libcurl) {
+    void *handle_libcurl = adl_test_dlsym(PATHNAME_LIBCURL, "Curl_open", true);
+    if (NULL != handle_libcurl) {
         LOG("--- adlclose(%s) : linker_handle %p", PATHNAME_LIBCURL,
-            (uintptr_t) linker_handle_libcurl);
-        adlclose(linker_handle_libcurl);
+            (uintptr_t)handle_libcurl);
+        adlclose(handle_libcurl);
     }
 }
 
