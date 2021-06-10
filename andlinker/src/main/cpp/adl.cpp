@@ -17,13 +17,14 @@ static constexpr ElfW(Versym) ADL_kVersymHiddenBit = 0x8000;
 typedef struct symbol_name {
     uint32_t elf_hash(void);
 
-    void gnu_hash(uint32_t *hash);
+    void gnu_hash(uint32_t *hash, uint32_t *len);
 
     const char *name_;
     bool has_elf_hash_;
     bool has_gnu_hash_;
     uint32_t elf_hash_;
-    uint32_t gnu_hash_[2];
+    uint32_t gnu_hash_;
+    uint32_t gnu_len_;
 } adl_symbol;
 
 typedef struct version_info {
@@ -175,23 +176,24 @@ uint32_t symbol_name::elf_hash(void) {
     return elf_hash_;
 }
 
-static void calculate_gnu_hash_simple(const char *name, uint32_t *hash) {
+static void calculate_gnu_hash_simple(const char *name,
+                                      uint32_t *hash, uint32_t *len) {
     uint32_t h = 5381;
     const uint8_t *name_bytes = reinterpret_cast<const uint8_t *>(name);
     while (*name_bytes != 0) {
         h += (h << 5) + *name_bytes++; // h*33 + c = h + h * 32 + c = h + h << 5 + c
     }
-    hash[0] = h;
-    hash[1] = reinterpret_cast<const char *>(name_bytes) - name;
+    *hash = h;
+    *len = reinterpret_cast<const char *>(name_bytes) - name;
 }
 
-void symbol_name::gnu_hash(uint32_t *hash) {
+void symbol_name::gnu_hash(uint32_t *hash, uint32_t *len) {
     if (!has_gnu_hash_) {
-        calculate_gnu_hash_simple(name_, gnu_hash_);
+        calculate_gnu_hash_simple(name_, &gnu_hash_, &gnu_len_);
         has_gnu_hash_ = true;
     }
-    hash[0] = gnu_hash_[0];
-    hash[1] = gnu_hash_[1];
+    *hash = gnu_hash_;
+    *len = gnu_len_;
 }
 
 static inline bool adl_is_symbol_global_and_defined(const adl_so_info *si, const ElfW(Sym) *s) {
@@ -419,7 +421,7 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
         return 0;
     }
 
-    ADLOGI("+++ adl_iterate_phdr_callback(%s)", info->dlpi_name);
+//    ADLOGI("+++ adl_iterate_phdr_callback(%s)", info->dlpi_name);
     if (info->dlpi_addr == 0) {
         ADLOGW("dlpi_addr is invalid.");
         return 0;
@@ -445,10 +447,10 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
     uintptr_t *it_args = (uintptr_t *) data;
     adl_iterate_phdr_cb callback = reinterpret_cast<adl_iterate_phdr_cb>(*it_args++);
     void *org_arg = reinterpret_cast<void *>(*it_args++);
-    ADLOGI(">>> dlpi_phdr = 0x%llx , dlpi_phnum %d , dlpi_addr = 0x%llx",
-           info->dlpi_phdr, info->dlpi_phnum, info->dlpi_addr);
+//    ADLOGI(">>> dlpi_phdr = 0x%llx , dlpi_phnum %d , dlpi_addr = 0x%llx",
+//           info->dlpi_phdr, info->dlpi_phnum, info->dlpi_addr);
     int result = callback(info, size, org_arg);
-    ADLOGI("+++ --------------------------------------");
+//    ADLOGI("+++ --------------------------------------");
     return result;
 }
 
@@ -517,8 +519,8 @@ static int adl_prelink_image(adl_so_info *soInfo) {
     uint32_t needed_count = 0;
     ElfW(Addr) load_bias = soInfo->load_bias;
     for (ElfW(Dyn) *d = soInfo->dynamic; d->d_tag != DT_NULL; ++d) {
-        ADLOGD("d = %p, d[0](tag) = %p d[1](val) = %p",
-               d, reinterpret_cast<void *>(d->d_tag), reinterpret_cast<void *>(d->d_un.d_val));
+//        ADLOGD("d = %p, d[0](tag) = %p d[1](val) = %p",
+//               d, reinterpret_cast<void *>(d->d_tag), reinterpret_cast<void *>(d->d_un.d_val));
         switch (d->d_tag) {
             case DT_SONAME:
                 // this is parsed after we have strtab initialized (see below).
@@ -768,10 +770,8 @@ static int adl_prelink_image(adl_so_info *soInfo) {
 
 static const ElfW(Sym) *
 adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
-    const uint32_t name_hash_len[] = {0, 0};
-    symbol_name.gnu_hash(const_cast<uint32_t *>(name_hash_len));
-    const uint32_t name_hash = name_hash_len[0];
-    const uint32_t name_len = name_hash_len[1];
+    uint32_t name_hash, name_len;
+    symbol_name.gnu_hash(&name_hash, &name_len);
 
     constexpr uint32_t kBloomMaskBits = sizeof(ElfW(Addr)) * 8;
 
@@ -1067,6 +1067,8 @@ int adlclose(void *handle) {
     adl_so_info *soInfo = (adl_so_info *) handle;
     if (NULL != soInfo->filename)
         free((void *) soInfo->filename);
+    if (NULL != soInfo->elf_reader)
+        static_cast<elf_reader *>(soInfo->elf_reader)->recycle();
     void *dlopen_handle = soInfo->dlopen_handle;
     free(soInfo);
     return dlclose(dlopen_handle);

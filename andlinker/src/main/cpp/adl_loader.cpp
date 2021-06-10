@@ -35,7 +35,7 @@ static void adl_loader_init(void) {
             ADLOGW("Linker [%s] NOT found.", LINKER_PATHNAME);
             return;
         }
-        ADLOGW("Linker handle(%p) found", handle);
+        ADLOGW("dlopen handle(%p) found", handle);
         adl_loader_dlopen = (adl_loader_dlopen_t) adlsym(handle, LINKER_DLOPEN);
     }
     adlclose(handle);
