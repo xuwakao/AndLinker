@@ -119,6 +119,15 @@ static bool adl_realpath_fd(int fd, const char *realpath) {
     return true;
 }
 
+
+static inline const void *adl_untag_address(const void *p) {
+#if defined(__aarch64__)
+    return reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(p) & ((1ULL << 56) - 1));
+#else
+    return p;
+#endif
+}
+
 __END_DECLS
 
 #endif //ANDLINKER_ADL_UTIL_H

@@ -254,8 +254,8 @@ bool elf_reader::read_other_section(void) {
             ADLOGE("\"%s\" symtab section mmap failed", name_);
             return false;
         }
-        shdr_symtab_ = reinterpret_cast<ElfW(Sym) *>(symtab_fragment_->data_);
-        shdr_symtab_num_ = shdr->sh_size / shdr->sh_entsize;
+        symtab_ = reinterpret_cast<ElfW(Sym) *>(symtab_fragment_->data_);
+        symtab_num_ = shdr->sh_size / shdr->sh_entsize;
 
         if (!check_file_range(shdr_strtab->sh_offset, shdr_strtab->sh_size,
                               alignof(const char))) {
@@ -299,8 +299,6 @@ bool elf_reader::check_file_range(ElfW(Addr) offset,
            ((offset % alignment) == 0);
 }
 
-__END_DECLS
-
 void elf_reader::recycle(void) {
     if (phdr_fragment_ != NULL) {
         phdr_fragment_->unmap();
@@ -319,7 +317,7 @@ void elf_reader::recycle(void) {
 
     if (symtab_fragment_ != NULL) {
         symtab_fragment_->unmap();
-        shdr_symtab_ = NULL;
+        symtab_ = NULL;
     }
 
     if (strtab_fragment_ != NULL) {
@@ -361,3 +359,5 @@ bool elf_reader::openFile(void) {
 //           name_, fd_, real_path_, file_size_);
     return true;
 }
+
+__END_DECLS

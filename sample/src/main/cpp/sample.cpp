@@ -66,6 +66,21 @@ adl_test_dlsym(const char *filename, const char *symbol, bool open_lib) {
     else
         LOGE("xxx adlsym(%s) not found", symbol);
 
+    // adladdr
+    Dl_info info;
+    if (0 != adladdr(symbol_addr, &info)) {
+        if (0 == info.dli_saddr) {
+            LOGE("xxx adladdr(%p) not found: %p, %s", (uintptr_t) symbol_addr,
+                 (uintptr_t) info.dli_fbase, info.dli_fname);
+        } else {
+            LOG(">>> adladdr(%p) : %p, %s, %p %s", (uintptr_t) symbol_addr,
+                (uintptr_t) info.dli_fbase, info.dli_fname,
+                (uintptr_t) info.dli_saddr, info.dli_sname);
+        }
+    } else
+        LOGE("xxx adladdr(%p) failed ", (uintptr_t) symbol_addr);
+
+
     LOG_END;
 
     return handle;
@@ -93,11 +108,10 @@ static void adl_test(JNIEnv *env, jobject thiz) {
     adl_test_dlsym(BASENAME_LIBCPP, "_ZNSt3__18valarrayImEC2Em", false);
     adl_test_dlsym(PATHNAME_LIBCPP, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE3putEc", false);
 
-    void *handle_libcurl = adl_test_dlsym(PATHNAME_LIBCURL, "Curl_open", true);
-    if (NULL != handle_libcurl) {
-        LOG("--- adlclose(%s) : linker_handle %p", PATHNAME_LIBCURL,
-            (uintptr_t)handle_libcurl);
-        adlclose(handle_libcurl);
+    //load elf file
+    void *handle = adl_test_dlsym(PATHNAME_LIBCURL, "Curl_open", true);
+    if (handle != NULL) {
+        adlclose(handle);
     }
 }
 

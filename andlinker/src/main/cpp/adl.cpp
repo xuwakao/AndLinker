@@ -42,14 +42,15 @@ typedef struct {
 } adl_tls_segment;
 
 typedef struct so_info {
-    void *dlopen_handle;
-    void *elf_reader;
-
     const char *filename;
     ElfW(Addr) base;//mmap load start
     const ElfW(Phdr) *phdr;
     ElfW(Half) phnum;
     uint32_t flags_ = ADL_FLAG_NEW_SOINFO;
+
+    struct so_info *next;
+    void *dlopen_handle;
+    void *elf_reader;
 
     ElfW(Dyn) *dynamic;
 
@@ -121,7 +122,7 @@ typedef struct so_info {
 
     size_t get_verdef_cnt(void) const;
 
-    const char *get_string(ElfW(Word) index) const;
+    const char *get_string(ElfW(Word) index) const;//dynamic strtab string
 } adl_so_info;
 
 bool so_info::is_gnu_hash(void) const {
@@ -151,7 +152,6 @@ const char *so_info::get_string(ElfW(Word) index) const {
 
     return strtab_ + index;
 }
-
 
 static uint32_t calculate_elf_hash(const char *name) {
     const uint8_t *name_bytes = reinterpret_cast<const uint8_t *>(name);
@@ -355,8 +355,8 @@ static size_t adl_phdr_table_get_load_size(const ElfW(Phdr) *phdr_table, size_t 
     return max_vaddr - min_vaddr;
 }
 
-static ElfW(Addr) resolve_symbol_address(const adl_so_info *soInfo,
-                                         const ElfW(Sym) *s) {
+static ElfW(Addr) adl_resolve_symbol_address(const adl_so_info *soInfo,
+                                             const ElfW(Sym) *s) {
     if (ELF_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
         //TODO : ifunc handle
 //        return call_ifunc_resolver(s->st_value + soInfo->load_bias);
@@ -490,6 +490,58 @@ static adl_so_info *adl_find_library(const char *filename) {
     uintptr_t args[2] = {reinterpret_cast<uintptr_t>(&soInfo),
                          (uintptr_t) filename};
     adl_iterate_phdr(adl_find_library_callback, args);
+    return soInfo;
+}
+
+static int
+adl_find_containing_library_callback(struct dl_phdr_info *info,
+                                     size_t size,
+                                     void *data) {
+    const ElfW(Phdr) *phdr_table = info->dlpi_phdr;
+    ElfW(Addr) min_vaddr, max_vaddr;
+    size_t load_size = adl_phdr_table_get_load_size(
+            phdr_table, info->dlpi_phnum, &min_vaddr, &max_vaddr);
+    if (min_vaddr == UINTPTR_MAX) return 0;//min address is invalid
+    ElfW(Addr) load_bias = info->dlpi_addr;
+    ElfW(Addr) base = load_bias + min_vaddr;
+
+    uintptr_t *it_args = (uintptr_t *) data;
+    adl_so_info **soInfo = reinterpret_cast<adl_so_info **>(*it_args++);
+    uintptr_t addr = *it_args;
+
+    // Addresses within a library may be tagged if they point to globals. Untag
+    // them so that the bounds check succeeds.
+    ElfW(Addr) address = reinterpret_cast<ElfW(Addr)>(adl_untag_address(
+            reinterpret_cast<const void *>(addr)));
+    if (address < base || address - base > load_size) {
+        return 0;
+    }
+
+    ElfW(Addr) vaddr = address - load_bias;
+    for (size_t i = 0; i != info->dlpi_phnum; ++i) {
+        const ElfW(Phdr) *phdr = &phdr_table[i];
+        if (phdr->p_type != PT_LOAD) {
+            continue;
+        }
+        if (vaddr >= phdr->p_vaddr && vaddr < phdr->p_vaddr + phdr->p_memsz) {
+            *soInfo = static_cast<adl_so_info *>(
+                    calloc(1, sizeof(adl_so_info)));
+            (*soInfo)->filename = strdup(info->dlpi_name);
+            (*soInfo)->load_bias = load_bias;
+            (*soInfo)->base = base;
+            (*soInfo)->phdr = info->dlpi_phdr;
+            (*soInfo)->phnum = info->dlpi_phnum;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static adl_so_info *adl_find_containing_library(const void *addr) {
+    adl_so_info *soInfo = NULL;
+    uintptr_t args[2] = {reinterpret_cast<uintptr_t>(&soInfo),
+                         (uintptr_t) addr};
+    adl_iterate_phdr(adl_find_containing_library_callback, args);
     return soInfo;
 }
 
@@ -768,6 +820,45 @@ static int adl_prelink_image(adl_so_info *soInfo) {
     return 0;
 }
 
+bool adl_read_elf(adl_so_info *soInfo) {
+    if (NULL != soInfo->elf_reader) {
+        return true;
+    }
+
+    if (soInfo->filename[0] != '/') {
+        ADLOGW("library path is not full path : %s", soInfo->filename);
+        return false;
+    }
+
+    ElfW(Ehdr) *elfHdr = reinterpret_cast<ElfW(Ehdr) *>(soInfo->base);
+    adl_elf_reader *reader = static_cast<adl_elf_reader *>(
+            calloc(1, sizeof(adl_elf_reader)));
+    reader->fd_ = -1;
+    reader->name_ = soInfo->filename;
+    reader->header_ = elfHdr;
+    reader->phdr_table_ = soInfo->phdr;
+    reader->dynamic_ = soInfo->dynamic;
+    soInfo->elf_reader = reader;
+
+    if (!reader->verify_elf_header()) {
+        ADLOGW("adl_so_info base address is not ELF header, try to load from file.");
+        if (!reader->read_elf_header(true)) {
+            ADLOGE("read elf header failed.");
+            return false;
+        }
+    } else {
+        ADLOGI("adl_so_info base address is already ELF header");
+    }
+
+    if (!reader->read_program_headers() ||
+        !reader->read_section_headers() ||
+        !reader->read_other_section()) {
+        ADLOGE("read elf(%s) information failed .", soInfo->filename);
+        return false;
+    }
+    return true;
+}
+
 static const ElfW(Sym) *
 adl_gnu_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info *vi) {
     uint32_t name_hash, name_len;
@@ -873,44 +964,14 @@ adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
 static const ElfW(Sym) *
 adl_symtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
                   const version_info *vi) {
-    if (soInfo->filename[0] != '/') {
-        ADLOGW("library path is not full path : %s", soInfo->filename);
+    if (!adl_read_elf(soInfo)) {
+        ADLOGW("read elf failed : %s", soInfo->filename);
         return NULL;
-    }
-
-    if (soInfo->elf_reader == NULL) {
-        ElfW(Ehdr) *elfHdr = reinterpret_cast<ElfW(Ehdr) *>(soInfo->base);
-        adl_elf_reader *reader = static_cast<adl_elf_reader *>(
-                calloc(1, sizeof(adl_elf_reader)));
-        reader->fd_ = -1;
-        reader->name_ = soInfo->filename;
-        reader->header_ = elfHdr;
-        reader->phdr_table_ = soInfo->phdr;
-        reader->dynamic_ = soInfo->dynamic;
-        soInfo->elf_reader = reader;
     }
 
     adl_elf_reader *elf_reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
-
-    if (!elf_reader->verify_elf_header()) {
-        ADLOGW("adl_so_info base address is not ELF header, try to load from file.");
-        if (!elf_reader->read_elf_header(true)) {
-            ADLOGE("read elf header failed.");
-            return NULL;
-        }
-    } else {
-        ADLOGI("adl_so_info base address is already ELF header");
-    }
-
-    if (!elf_reader->read_program_headers() ||
-        !elf_reader->read_section_headers() ||
-        !elf_reader->read_other_section()) {
-        ADLOGE("read elf(%s) information failed .", soInfo->filename);
-        return NULL;
-    }
-
-    for (size_t i = 0; i < elf_reader->shdr_symtab_num_; i++) {
-        const ElfW(Sym) *sym = &elf_reader->shdr_symtab_[i];
+    for (size_t i = 0; i < elf_reader->symtab_num_; i++) {
+        const ElfW(Sym) *sym = &elf_reader->symtab_[i];
         //check not special section/reserved indices
         //See : https://docs.oracle.com/cd/E23824_01/html/819-0690/chapter6-94076.html
         if (sym->st_shndx == SHN_UNDEF ||
@@ -943,6 +1004,94 @@ static const ElfW(Sym) *adlsym_handle_lookup(adl_so_info *soInfo,
         symbol = adl_elf_lookup(soInfo, symbol_name, vi);
     if (symbol == NULL)
         symbol = adl_symtab_lookup(soInfo, symbol_name, vi);
+    return symbol;
+}
+
+static bool symbol_matches_soaddr(const ElfW(Sym) *sym, ElfW(Addr) soaddr) {
+    // Skip TLS symbols. A TLS symbol's value is relative to the start of the TLS segment rather than
+    // to the start of the solib. The solib only reserves space for the initialized part of the TLS
+    // segment. (i.e. .tdata is followed by .tbss, and .tbss overlaps other sections.)
+    return sym->st_shndx != SHN_UNDEF &&
+           ELF_ST_TYPE(sym->st_info) != STT_TLS &&
+           soaddr >= sym->st_value &&
+           soaddr < sym->st_value + sym->st_size;
+}
+
+static const ElfW(Sym) *adl_gnu_addr_lookup(so_info *soInfo,
+                                            const void *addr,
+                                            uintptr_t *sym_str) {
+    ElfW(Addr) soaddr = reinterpret_cast<ElfW(Addr)>(addr) - soInfo->load_bias;
+
+    for (size_t i = 0; i < soInfo->gnu_nbucket_; ++i) {
+        uint32_t n = soInfo->gnu_bucket_[i];
+
+        if (n == 0) {
+            continue;
+        }
+
+        do {
+            ElfW(Sym) *sym = soInfo->symtab_ + n;
+            if (symbol_matches_soaddr(sym, soaddr)) {
+                *sym_str = (uintptr_t) &soInfo->strtab_[sym->st_name];
+                return sym;
+            }
+        } while ((soInfo->gnu_chain_[n++] & 1) == 0);
+    }
+
+    return NULL;
+}
+
+static const ElfW(Sym) *adl_elf_addr_lookup(so_info *soInfo,
+                                            const void *addr,
+                                            uintptr_t *sym_str) {
+    ElfW(Addr) soaddr = reinterpret_cast<ElfW(Addr)>(addr) - soInfo->load_bias;
+
+    // Search the library's symbol table for any defined symbol which
+    // contains this address.
+    for (size_t i = 0; i < soInfo->nchain_; ++i) {
+        ElfW(Sym) *sym = soInfo->symtab_ + i;
+        if (symbol_matches_soaddr(sym, soaddr)) {
+            *sym_str = (uintptr_t) &soInfo->strtab_[sym->st_name];
+            return sym;
+        }
+    }
+
+    return NULL;
+}
+
+static const ElfW(Sym) *adl_symtab_addr_lookup(so_info *soInfo,
+                                               const void *addr,
+                                               uintptr_t *sym_str) {
+    if (!adl_read_elf(soInfo)) {
+        ADLOGW("read elf failed : %s", soInfo->filename);
+        return NULL;
+    }
+
+    adl_elf_reader *elf_reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
+    ElfW(Addr) soaddr = reinterpret_cast<ElfW(Addr)>(addr) - soInfo->load_bias;
+    for (size_t i = 0; i < elf_reader->symtab_num_; ++i) {
+        const ElfW(Sym) *sym = &elf_reader->symtab_[i];
+        if (symbol_matches_soaddr(sym, soaddr)) {
+            *sym_str = (uintptr_t) &elf_reader->strtab_[sym->st_name];
+            return sym;
+        }
+    }
+    return NULL;
+}
+
+static const ElfW(Sym) *find_symbol_by_address(so_info *soInfo,
+                                               const void *addr,
+                                               uintptr_t *sym_str) {
+    if (adl_prelink_image(soInfo) < 0)
+        return NULL;
+
+    const ElfW(Sym) *symbol = NULL;
+    if (soInfo->is_gnu_hash())
+        symbol = adl_gnu_addr_lookup(soInfo, addr, sym_str);
+    if (symbol == NULL && soInfo->nchain_ > 0)
+        symbol = adl_elf_addr_lookup(soInfo, addr, sym_str);
+    if (symbol == NULL)
+        symbol = adl_symtab_addr_lookup(soInfo, addr, sym_str);
     return symbol;
 }
 
@@ -985,7 +1134,7 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
 //                *symbol = static_cast<char*>(tls_block) + sym->st_value;
                 return false;
             } else {
-                ElfW(Addr) resolved_addr = resolve_symbol_address(soInfo, sym);
+                ElfW(Addr) resolved_addr = adl_resolve_symbol_address(soInfo, sym);
                 if (resolved_addr == 0)
                     return false;
                 *symbol = reinterpret_cast<void *>(resolved_addr);
@@ -1071,7 +1220,36 @@ int adlclose(void *handle) {
         static_cast<elf_reader *>(soInfo->elf_reader)->recycle();
     void *dlopen_handle = soInfo->dlopen_handle;
     free(soInfo);
-    return dlclose(dlopen_handle);
+    if (NULL != dlopen_handle) {
+        return dlclose(dlopen_handle);
+    }
+    return 0;
+}
+
+int adladdr(const void *addr, Dl_info *info) {
+    // Determine if this address can be found in any library currently mapped.
+    adl_so_info *si = adl_find_containing_library(addr);
+    if (si == NULL) {
+        ADLOGW("adladdr find(%p) containing lib failed.", addr);
+        return 0;
+    }
+
+    memset(info, 0, sizeof(Dl_info));
+
+    info->dli_fname = si->filename;
+    // Address at which the shared object is loaded.
+    info->dli_fbase = reinterpret_cast<void *>(si->base);
+
+    uintptr_t sym_str;
+    // Determine if any symbol in the library contains the specified address.
+    const ElfW(Sym) *sym = find_symbol_by_address(si, addr, &sym_str);
+    if (sym != NULL) {
+        info->dli_sname = reinterpret_cast<const char *>(sym_str);
+        info->dli_saddr = reinterpret_cast<void *>(
+                adl_resolve_symbol_address(si, sym));
+    }
+
+    return 1;
 }
 
 __END_DECLS
