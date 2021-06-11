@@ -19,8 +19,6 @@ void *adlopen(const char *__filename, int __flag);
 
 int adlclose(void *__handle);
 
-char *adlerror(void);
-
 void *adlsym(void *__handle, const char *__symbol);
 
 void *adlvsym(void *__handle,
