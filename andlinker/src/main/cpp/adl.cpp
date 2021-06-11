@@ -437,6 +437,9 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
     struct dl_phdr_info ret_info;
     info = static_cast<dl_phdr_info *>(memcpy(&ret_info, info, sizeof(dl_phdr_info)));
 
+    /**
+     * Unexpected case : meizu 16th 8.1.0 (flyme 8.20.6.30 beta)
+     */
     if (NULL == info->dlpi_phdr || 0 == info->dlpi_phnum) {
         ADLOGW("No program header table in ELF [%s], try to fix it.", info->dlpi_name);
         ElfW(Ehdr) *ehdr = (ElfW(Ehdr) *) info->dlpi_addr;
