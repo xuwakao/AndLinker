@@ -338,8 +338,9 @@ bool elf_reader::openFile(void) {
         return true;
     }
     int fd = open(name_, O_RDONLY | O_CLOEXEC);
+    real_path_ = static_cast<const char *>(calloc(PATH_MAX, sizeof(char)));
     static char path[PATH_MAX];
-    if (fd == -1 || !adl_realpath_fd(fd, path)) {
+    if (fd == -1 || !adl_realpath_fd(fd, real_path_)) {
         ADLOGE("open or get real path failed : %d, %s", fd, name_);
         return false;
     } else {
@@ -353,7 +354,6 @@ bool elf_reader::openFile(void) {
     }
 
     fd_ = fd;
-    real_path_ = path;
     file_size_ = file_stat.st_size;
 //    ADLOGI("open file(%s) success[%d , %s, %d]",
 //           name_, fd_, real_path_, file_size_);

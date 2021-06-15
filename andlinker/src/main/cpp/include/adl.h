@@ -28,6 +28,7 @@ void *adlvsym(void *__handle,
 int adladdr(const void *__addr, Dl_info *__info);
 
 //link.h
+//https://android.googlesource.com/platform/bionic/+/master/docs/status.md
 typedef int (*adl_iterate_phdr_cb)(struct dl_phdr_info *info, size_t size, void *arg);
 int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *), void *__data);
 
