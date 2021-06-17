@@ -64,55 +64,7 @@ bool elf_reader::read_elf_header(bool force) {
 }
 
 bool elf_reader::verify_elf_header(void) {
-    if (header_ == NULL) {
-        return false;
-    }
-    if (memcmp(header_->e_ident, ELFMAG, SELFMAG) != 0) {
-        ADLOGE("\"%s\" has bad ELF magic: %02x%02x%02x%02x", name_,
-               header_->e_ident[0], header_->e_ident[1], header_->e_ident[2], header_->e_ident[3]);
-        return false;
-    }
-
-    if (header_->e_ident[EI_DATA] != ELFDATA2LSB) {
-        ADLOGE("\"%s\" not little-endian: %d", name_, header_->e_ident[EI_DATA]);
-        return false;
-    }
-
-    if (header_->e_type != ET_DYN) {
-        ADLOGE("\"%s\" has unexpected e_type: %d", name_, header_->e_type);
-        return false;
-    }
-
-    if (header_->e_version != EV_CURRENT) {
-        ADLOGE("\"%s\" has unexpected e_version: %d", name_, header_->e_version);
-        return false;
-    }
-
-    if (header_->e_shentsize != sizeof(ElfW(Shdr))) {
-        // Fail if app is targeting Android O or above
-        if (adl_get_api_level() >= 26) {
-            ADLOGE("\"%s\" has unsupported e_shentsize: 0x%x (expected 0x%zx)",
-                   name_, header_->e_shentsize, sizeof(ElfW(Shdr)));
-            return false;
-        }
-        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
-               "\"%s\" has unsupported e_shentsize 0x%x (expected 0x%zx)",
-               name_, header_->e_shentsize, sizeof(ElfW(Shdr)));
-        ADLOGW(name_, "has invalid ELF header");
-    }
-
-    if (header_->e_shstrndx == 0) {
-        // Fail if app is targeting Android O or above
-        if (adl_get_api_level() >= 26) {
-            ADLOGE("\"%s\" has invalid e_shstrndx", name_);
-            return false;
-        }
-
-        ADLOGW("invalid-elf-header_section-headers-enforced-for-api-level-26, "
-               "\"%s\" has invalid e_shstrndx", name_);
-        ADLOGW(name_, "has invalid ELF header");
-    }
-    return true;
+    return adl_verify_elf_header(header_);
 }
 
 // Loads the program header table from an ELF file into a read-only private
@@ -219,65 +171,91 @@ bool elf_reader::read_other_section(void) {
     shstrtab_ = static_cast<const char *>(shstrtab_fragment_->data_);
     shstrtab_size_ = shstrtab_fragment_->size_;
 
+    int read_all_sym_count = 0;
     for (const ElfW(Shdr) *shdr = shdr_table_;
          shdr < shdr_table_ + header_->e_shnum; shdr++) {
         const char *shdr_name = shstrtab_ + shdr->sh_name;
 
-        //find the .symtab
-        if (SHT_SYMTAB != shdr->sh_type || strcmp(".symtab", shdr_name) != 0)
+        //find the .symtab and .dynsym
+        if (SHT_SYMTAB != shdr->sh_type &&
+            SHT_DYNSYM != shdr->sh_type)
             continue;
 
-        //.symtab link to .strtab
-        if (shdr->sh_link >= header_->e_shnum) {
-            ADLOGW("\"%s\" .symtab section sh_link invalid", name_);
+        //read .dynsym table num
+        if (0 == strcmp(".dynsym", shdr_name)) {
+            //.dynsym link to .dynstr
+            if (shdr->sh_link >= header_->e_shnum) {
+                ADLOGW("\"%s\" .dynsym section sh_link invalid", name_);
+                continue;
+            }
+
+            const ElfW(Shdr *)shdr_strtab = &shdr_table_[shdr->sh_link];
+            if (shdr_strtab->sh_type != SHT_STRTAB) {
+                continue;
+            }
+            dynsym_num_ = shdr->sh_size / shdr->sh_entsize;
+            if (++read_all_sym_count >= 2) {
+                break;
+            }
             continue;
         }
 
-        const ElfW(Shdr *)shdr_strtab = &shdr_table_[shdr->sh_link];
-        if (shdr_strtab->sh_type != SHT_STRTAB) {
-            continue;
-        }
-        if (!check_file_range(shdr->sh_offset, shdr->sh_size,
-                              alignof(const char))) {
-            ADLOGE("\"%s\" has invalid offset/size of the .symtab section",
-                   name_);
-            return false;
-        }
+        //.symtab
+        if (0 == strcmp(".symtab", shdr_name)) {
+            //.symtab link to .strtab
+            if (shdr->sh_link >= header_->e_shnum) {
+                ADLOGW("\"%s\" .symtab section sh_link invalid", name_);
+                continue;
+            }
 
-        if (symtab_fragment_ == NULL) {
-            symtab_fragment_ = static_cast<map_file_fragment *>(
-                    calloc(1, sizeof(map_file_fragment)));
-        }
+            const ElfW(Shdr *)shdr_strtab = &shdr_table_[shdr->sh_link];
+            if (shdr_strtab->sh_type != SHT_STRTAB) {
+                continue;
+            }
+            if (!check_file_range(shdr->sh_offset, shdr->sh_size,
+                                  alignof(const char))) {
+                ADLOGE("\"%s\" has invalid offset/size of the .symtab section",
+                       name_);
+                continue;
+            }
 
-        if (!symtab_fragment_->map(fd_, file_size_, file_offset_, shdr->sh_offset,
-                                   shdr->sh_size)) {
-            ADLOGE("\"%s\" symtab section mmap failed", name_);
-            return false;
-        }
-        symtab_ = reinterpret_cast<ElfW(Sym) *>(symtab_fragment_->data_);
-        symtab_num_ = shdr->sh_size / shdr->sh_entsize;
+            if (symtab_fragment_ == NULL) {
+                symtab_fragment_ = static_cast<map_file_fragment *>(
+                        calloc(1, sizeof(map_file_fragment)));
+            }
 
-        if (!check_file_range(shdr_strtab->sh_offset, shdr_strtab->sh_size,
-                              alignof(const char))) {
-            ADLOGE("\"%s\" has invalid offset/size of the .strtab section",
-                   name_);
-            return false;
-        }
+            if (!symtab_fragment_->map(fd_, file_size_, file_offset_, shdr->sh_offset,
+                                       shdr->sh_size)) {
+                ADLOGE("\"%s\" symtab section mmap failed", name_);
+                continue;
+            }
+            symtab_ = reinterpret_cast<ElfW(Sym) *>(symtab_fragment_->data_);
+            symtab_num_ = shdr->sh_size / shdr->sh_entsize;
 
-        if (strtab_fragment_ == NULL) {
-            strtab_fragment_ = static_cast<map_file_fragment *>(
-                    calloc(1, sizeof(map_file_fragment)));
-        }
+            if (!check_file_range(shdr_strtab->sh_offset, shdr_strtab->sh_size,
+                                  alignof(const char))) {
+                ADLOGE("\"%s\" has invalid offset/size of the .strtab section",
+                       name_);
+                continue;
+            }
 
-        if (!strtab_fragment_->map(fd_, file_size_, file_offset_, shdr_strtab->sh_offset,
-                                   shdr_strtab->sh_size)) {
-            ADLOGE("\"%s\" .strtab section mmap failed", name_);
-            return false;
-        }
+            if (strtab_fragment_ == NULL) {
+                strtab_fragment_ = static_cast<map_file_fragment *>(
+                        calloc(1, sizeof(map_file_fragment)));
+            }
 
-        strtab_ = static_cast<const char *>(strtab_fragment_->data_);
-        strtab_size_ = shdr_strtab->sh_size;
-        break;
+            if (!strtab_fragment_->map(fd_, file_size_, file_offset_, shdr_strtab->sh_offset,
+                                       shdr_strtab->sh_size)) {
+                ADLOGE("\"%s\" .strtab section mmap failed", name_);
+                continue;
+            }
+
+            strtab_ = static_cast<const char *>(strtab_fragment_->data_);
+            strtab_size_ = shdr_strtab->sh_size;
+            if (++read_all_sym_count >= 2) {
+                break;
+            }
+        }
     }
     return true;
 }
@@ -338,9 +316,8 @@ bool elf_reader::openFile(void) {
         return true;
     }
     int fd = open(name_, O_RDONLY | O_CLOEXEC);
-    real_path_ = static_cast<const char *>(calloc(PATH_MAX, sizeof(char)));
     static char path[PATH_MAX];
-    if (fd == -1 || !adl_realpath_fd(fd, real_path_)) {
+    if (fd == -1 || !adl_realpath_fd(fd, path)) {
         ADLOGE("open or get real path failed : %d, %s", fd, name_);
         return false;
     } else {
@@ -355,6 +332,7 @@ bool elf_reader::openFile(void) {
 
     fd_ = fd;
     file_size_ = file_stat.st_size;
+    real_path_ = strdup(path);
 //    ADLOGI("open file(%s) success[%d , %s, %d]",
 //           name_, fd_, real_path_, file_size_);
     return true;

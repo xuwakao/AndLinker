@@ -50,6 +50,7 @@ typedef struct elf_reader {
     adl_map_file_fragment *symtab_fragment_;
     const ElfW(Sym) *symtab_;
     size_t symtab_num_;
+    size_t dynsym_num_;
 
     adl_map_file_fragment *strtab_fragment_;
     const char *strtab_;

@@ -11,6 +11,10 @@ __BEGIN_DECLS
 
 void *adl_load(const char *filename);
 
+void adl_loader_lock(void);
+
+void adl_loader_unlock(void);
+
 __END_DECLS
 
 

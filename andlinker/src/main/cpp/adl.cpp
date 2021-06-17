@@ -1,5 +1,5 @@
 #include <jni.h>
-#include <malloc.h>
+#include <cstdlib>
 #include <sys/param.h>
 #include <fcntl.h>
 
@@ -46,7 +46,7 @@ typedef struct so_info {
     ElfW(Addr) base;//mmap load start
     const ElfW(Phdr) *phdr;
     ElfW(Half) phnum;
-    uint32_t flags_ = ADL_FLAG_NEW_SOINFO;
+    uint32_t flags_;
 
     struct so_info *next;
     void *dlopen_handle;
@@ -306,55 +306,6 @@ static inline bool check_symbol_version(const ElfW(Versym) *ver_table, uint32_t 
 //           verneed == (verdef & ~ADL_kVersymHiddenBit);
 }
 
-/* Returns the size of the extent of all the possibly non-contiguous
- * loadable segments in an ELF program header table. This corresponds
- * to the page-aligned size in bytes that needs to be reserved in the
- * process' address space. If there are no loadable segments, 0 is
- * returned.
- *
- * If out_min_vaddr or out_max_vaddr are not null, they will be
- * set to the minimum and maximum addresses of pages to be reserved,
- * or 0 if there is nothing to load.
- */
-static size_t adl_phdr_table_get_load_size(const ElfW(Phdr) *phdr_table, size_t phdr_count,
-                                           ElfW(Addr) *out_min_vaddr,
-                                           ElfW(Addr) *out_max_vaddr) {
-    ElfW(Addr) min_vaddr = UINTPTR_MAX;
-    ElfW(Addr) max_vaddr = 0;
-
-    bool found_pt_load = false;
-    for (size_t i = 0; i < phdr_count; ++i) {
-        const ElfW(Phdr) *phdr = &phdr_table[i];
-
-        if (phdr->p_type != PT_LOAD) {
-            continue;
-        }
-        found_pt_load = true;
-
-        if (phdr->p_vaddr < min_vaddr) {
-            min_vaddr = phdr->p_vaddr;
-        }
-
-        if (phdr->p_vaddr + phdr->p_memsz > max_vaddr) {
-            max_vaddr = phdr->p_vaddr + phdr->p_memsz;
-        }
-    }
-    if (!found_pt_load) {
-        min_vaddr = 0;
-    }
-
-    min_vaddr = PAGE_START(min_vaddr);
-    max_vaddr = PAGE_END(max_vaddr);
-
-    if (out_min_vaddr != NULL) {
-        *out_min_vaddr = min_vaddr;
-    }
-    if (out_max_vaddr != NULL) {
-        *out_max_vaddr = max_vaddr;
-    }
-    return max_vaddr - min_vaddr;
-}
-
 static ElfW(Addr) adl_resolve_symbol_address(const adl_so_info *soInfo,
                                              const ElfW(Sym) *s) {
     if (ELF_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
@@ -417,18 +368,30 @@ bool adl_check_tls_alignment(size_t *alignment) {
  */
 static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, void *data) {
     if (NULL == info->dlpi_name || '\0' == info->dlpi_name[0]) {
-        ADLOGW("adl_iterate_phdr_callback dlpi_name is invalid.");
+        ADLOGW("adl_iterate_phdr_callback dlpi_name(%s) is invalid.", info->dlpi_name);
         return 0;
     }
 
 //    ADLOGI("+++ adl_iterate_phdr_callback(%s)", info->dlpi_name);
     if (info->dlpi_addr == 0) {
-        ADLOGW("dlpi_addr is invalid.");
+        ADLOGW("dlpi_addr for [%s] is invalid.", info->dlpi_name);
         return 0;
     }
 
     if ('/' != info->dlpi_name[0] && '[' != info->dlpi_name[0]) {
-        ADLOGW("Loaded without full path name.");
+//        const ElfW(Phdr) *phdr_table = info->dlpi_phdr;
+//        ElfW(Addr) min_vaddr, max_vaddr;
+//        adl_phdr_table_get_load_size(phdr_table, info->dlpi_phnum, &min_vaddr,
+//                                     &max_vaddr);
+//        if (min_vaddr == UINTPTR_MAX) return 0;//min address is invalid
+//        ElfW(Addr) load_bias = info->dlpi_addr;
+//        ElfW(Addr) base = load_bias + min_vaddr;
+//        char pathname[PATH_MAX];
+//        ADLOGW("Loaded(%s) 11 without full path name.", info->dlpi_name);
+//        if (adl_read_path_by_base(base, pathname, PATH_MAX)) {
+//            info->dlpi_name = pathname;
+//        }
+        ADLOGW("Loaded(%s) without full path name.", info->dlpi_name);
     }
 
     /**
@@ -457,7 +420,8 @@ static int adl_iterate_phdr_callback(struct dl_phdr_info *info, size_t size, voi
     return result;
 }
 
-static int adl_find_library_callback(struct dl_phdr_info *info, size_t size, void *data) {
+static int adl_find_library_callback(struct dl_phdr_info *info,
+                                     size_t size, void *data) {
     const ElfW(Phdr) *phdr_table = info->dlpi_phdr;
     ElfW(Addr) min_vaddr, max_vaddr;
     adl_phdr_table_get_load_size(phdr_table, info->dlpi_phnum, &min_vaddr,
@@ -479,15 +443,65 @@ static int adl_find_library_callback(struct dl_phdr_info *info, size_t size, voi
         if ('/' != *(info->dlpi_name + (strlen(info->dlpi_name) - strlen(filename)) - 1)) return 0;
     }
 
-    *soInfo = static_cast<adl_so_info *>(calloc(1, sizeof(adl_so_info)));
+    *soInfo = static_cast<adl_so_info *>(calloc(1, sizeof(so_info)));
     (*soInfo)->filename = strdup(info->dlpi_name);
     (*soInfo)->load_bias = load_bias;
     (*soInfo)->base = base;
     (*soInfo)->phdr = info->dlpi_phdr;
     (*soInfo)->phnum = info->dlpi_phnum;
+    (*soInfo)->flags_ = ADL_FLAG_NEW_SOINFO;
     return 1;
 }
 
+static adl_so_info *adl_find_library_by_maps(const char *filename) {
+    adl_so_info *soInfo = NULL;
+    ElfW(Addr) start = adl_read_base_by_maps(filename);
+    ElfW(Ehdr) *elfHdr = reinterpret_cast<ElfW(Ehdr) *>(start);
+    adl_elf_reader *reader = static_cast<adl_elf_reader *>(
+            calloc(1, sizeof(adl_elf_reader)));
+    reader->fd_ = -1;
+    reader->name_ = soInfo->filename;
+    reader->header_ = elfHdr;
+    if (!reader->verify_elf_header()) {
+        ADLOGW("maps(%s) base is not elf header", filename);
+        return NULL;
+    }
+    const ElfW(Phdr) *phdr_table = reinterpret_cast<const ElfW(Phdr) *>(elfHdr +
+                                                                        elfHdr->e_phoff);
+    ElfW(Addr) min_vaddr, max_vaddr;
+    adl_phdr_table_get_load_size(phdr_table, elfHdr->e_phnum, &min_vaddr,
+                                 &max_vaddr);
+    if (min_vaddr == UINTPTR_MAX) return NULL;//min address is invalid
+    ElfW(Addr) load_bias = start - min_vaddr;
+
+    soInfo = static_cast<adl_so_info *>(calloc(1, sizeof(so_info)));
+    soInfo->filename = strdup(filename);
+    soInfo->load_bias = load_bias;
+    soInfo->base = start;
+    soInfo->phdr = phdr_table;
+    soInfo->phnum = elfHdr->e_phnum;
+    soInfo->flags_ = ADL_FLAG_NEW_SOINFO;
+    ADLOGI(">>> adl_find_library_by_maps filename = 0x%s , load_bias = 0x%llx",
+           soInfo->filename, soInfo->load_bias);
+    return soInfo;
+}
+
+/**
+ *
+ * arm :
+ * android 4.x : read /proc/self/maps.
+ * android 5.x : dl_iterate_phdr is supported in NDK, but global g_dl_mutex is not exported.
+ * android 6-8.0 : dl_iterate_phdr not return linker/linker64.
+ * > android 8.1 : dl_iterate_phdr perform PERFECTLY
+ *
+ * On some 4.x and 5.x devices, dl_iterate_phdr return basename instead of pathname
+ *
+ * x86 :
+ * android 4.x, dl_iterate_phdr is supported, but global g_dl_mutex is not exported.
+ *
+ * @param filename
+ * @return
+ */
 static adl_so_info *adl_find_library(const char *filename) {
     adl_so_info *soInfo = NULL;
     uintptr_t args[2] = {reinterpret_cast<uintptr_t>(&soInfo),
@@ -527,13 +541,13 @@ adl_find_containing_library_callback(struct dl_phdr_info *info,
             continue;
         }
         if (vaddr >= phdr->p_vaddr && vaddr < phdr->p_vaddr + phdr->p_memsz) {
-            *soInfo = static_cast<adl_so_info *>(
-                    calloc(1, sizeof(adl_so_info)));
+            *soInfo = static_cast<adl_so_info *>(calloc(1, sizeof(so_info)));
             (*soInfo)->filename = strdup(info->dlpi_name);
             (*soInfo)->load_bias = load_bias;
             (*soInfo)->base = base;
             (*soInfo)->phdr = info->dlpi_phdr;
             (*soInfo)->phnum = info->dlpi_phnum;
+            (*soInfo)->flags_ = ADL_FLAG_NEW_SOINFO;
             return 1;
         }
     }
@@ -550,6 +564,7 @@ static adl_so_info *adl_find_containing_library(const void *addr) {
 
 static int adl_prelink_image(adl_so_info *soInfo) {
     if (soInfo->flags_ & ADL_FLAG_PRELINKED) return 0;
+    ADLOGI("adl prelink image : %s", soInfo->filename);
     /* Extract dynamic section */
     ElfW(Word) dynamic_flags = 0;
     adl_phdr_table_get_dynamic_section(soInfo->phdr, soInfo->phnum, soInfo->load_bias,
@@ -626,10 +641,6 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 }
                 break;
             case DT_PLTREL:
-                if (d->d_un.d_val != DT_RELA) {
-                    ADLOGE("unsupported DT_PLTREL in \"%s\"; expected DT_RELA", soInfo->filename);
-                    return false;
-                }
 #if defined(ADL_USE_RELA)
                 if (d->d_un.d_val != DT_RELA) {
                     ADLOGE("unsupported DT_PLTREL in \"%s\"; expected DT_RELA", soInfo->filename);
@@ -962,14 +973,55 @@ adl_elf_lookup(adl_so_info *soInfo, adl_symbol &symbol_name, const version_info 
     return NULL;
 }
 
-//MAYBE elf header is inside the first loadable segment in some case.(No PT_PHDR and
-// first loadable segment p_offset == 0)
+static const ElfW(Sym) *
+adl_dynsymtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
+                     const version_info *vi) {
+    const ElfW(Ehdr) *ehdr = reinterpret_cast<const ElfW(Ehdr) *>(soInfo->base);
+    if (!adl_verify_elf_header(ehdr)) {
+        ADLOGW("base is not elf header when to find symbol in .dynsym");
+        return NULL;
+    }
+
+    if (NULL == soInfo->symtab_ || NULL == soInfo->strtab_) {
+        ADLOGW("symtab_ or strtab_ NULL when to find symbol in .dynsym");
+        return NULL;
+    }
+    adl_elf_reader *elf_reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
+    for (size_t i = 0; i < elf_reader->dynsym_num_; i++) {
+        const ElfW(Sym) *sym = &soInfo->symtab_[i];
+        //check not special section/reserved indices
+        //See : https://docs.oracle.com/cd/E23824_01/html/819-0690/chapter6-94076.html
+        if (sym->st_shndx == SHN_UNDEF ||
+            (sym->st_shndx >= SHN_LORESERVE && sym->st_shndx <= SHN_HIRESERVE)) {
+            continue;
+        }
+
+        const char *symbol = &soInfo->strtab_[sym->st_name];
+
+//        ADLOGI("FINDING[.dynsym] %s", symbol);
+        if (strcmp(symbol, symbol_name.name_) == 0) {
+            ADLOGI("FOUND[.dynsym] %s in %s (%p) %zd",
+                   symbol_name.name_, soInfo->filename,
+                   reinterpret_cast<void *>(sym->st_value),
+                   static_cast<size_t>(sym->st_size));
+            return sym;
+        }
+    }
+    return NULL;
+}
+
+//find symbol in .dynsym or .symtab
 static const ElfW(Sym) *
 adl_symtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
                   const version_info *vi) {
     if (!adl_read_elf(soInfo)) {
         ADLOGW("read elf failed : %s", soInfo->filename);
         return NULL;
+    }
+
+    const ElfW(Sym) *dynsym = adl_dynsymtab_lookup(soInfo, symbol_name, vi);
+    if (NULL != dynsym) {
+        return dynsym;
     }
 
     adl_elf_reader *elf_reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
@@ -983,6 +1035,8 @@ adl_symtab_lookup(adl_so_info *soInfo, adl_symbol &symbol_name,
         }
 
         const char *symbol = &elf_reader->strtab_[sym->st_name];
+
+//        ADLOGI("FINDING[strtab] %s", symbol);
         if (strcmp(symbol, symbol_name.name_) == 0) {
             ADLOGI("FOUND[strtab] %s in %s (%p) %zd",
                    symbol_name.name_, soInfo->filename,
@@ -1183,34 +1237,32 @@ void *adlopen(const char *filename, int flag) {
         ADLOGW("adlopen(%s) file not exist", filename);
         return NULL;
     }
-    int level = adl_get_api_level();
-    if (level >= __ANDROID_API_O_MR1__) {
-        adl_so_info *soInfo = adl_find_library(filename);
-        if (soInfo != NULL) {
-            ADLOGI("adlopen Elf(%s) is found at : [0x%llx,0x%llx,%d]", soInfo->filename,
-                   soInfo->load_bias,
-                   soInfo->base, soInfo->phdr->p_vaddr);
-            return soInfo;
-        } else {
-            void *dlopen_handle = adl_load(filename);
-            if (dlopen_handle == NULL) {
-                ADLOGW("adlopen Elf(%s) not loaded", filename);
-                return NULL;
-            }
-            soInfo = adl_find_library(filename);
-            if (soInfo == NULL) {
-                ADLOGW("adlopen Elf(%s) not loaded again", filename);
-                dlclose(dlopen_handle);
-                return NULL;
-            }
-            ADLOGI("adlopen Elf(%s) is loaded at : [0x%llx,0x%llx,%d]", soInfo->filename,
-                   soInfo->load_bias,
-                   soInfo->base, soInfo->phdr->p_vaddr);
-            soInfo->dlopen_handle = dlopen_handle;
-            return (void *) soInfo;
-        }
+    adl_so_info *soInfo = adl_find_library(filename);
+    if (soInfo != NULL) {
+        ADLOGI("adlopen Elf(%s) is found at : [0x%" PRIx64 " 0x%" PRIx64 ", 0x%" PRIx64 "]",
+               soInfo->filename,
+               soInfo->load_bias,
+               soInfo->base, soInfo->phdr->p_vaddr);
+        return soInfo;
     }
-    return NULL;
+
+    void *dlopen_handle = adl_load(filename);
+    if (dlopen_handle == NULL) {
+        ADLOGW("adlopen Elf(%s) not loaded", filename);
+        return NULL;
+    }
+    soInfo = adl_find_library(filename);
+    if (soInfo == NULL) {
+        ADLOGW("adlopen Elf(%s) not loaded again", filename);
+        dlclose(dlopen_handle);
+        return NULL;
+    }
+    ADLOGI("adlopen Elf(%s) is loaded at : [0x%" PRIx64 " 0x%" PRIx64 ", 0x%" PRIx64 "]",
+           soInfo->filename,
+           soInfo->load_bias,
+           soInfo->base, soInfo->phdr->p_vaddr);
+    soInfo->dlopen_handle = dlopen_handle;
+    return (void *) soInfo;
 }
 
 int adlclose(void *handle) {

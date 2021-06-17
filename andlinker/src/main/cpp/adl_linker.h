@@ -8,10 +8,11 @@
 #include <sys/cdefs.h>
 #include <stdint.h>
 #include "adl.h"
+#include "adl_util.h"
 
 __BEGIN_DECLS
 
-int adl_do_iterate_phdr(adl_iterate_phdr_cb callback, void *__data);
+int adl_do_iterate_phdr(adl_iterate_phdr_cb callback, void *data);
 
 __END_DECLS
 
