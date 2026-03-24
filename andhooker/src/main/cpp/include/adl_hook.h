@@ -10,37 +10,22 @@
 __BEGIN_DECLS
 
 /**
- * Recursion guard for inline hook proxy functions.
+ * Inline hook includes automatic recursion prevention via a "hub" mechanism.
+ * When a proxy function internally calls other functions that re-enter the
+ * hooked function, the hub detects the recursion and calls the original
+ * function directly, preventing infinite loops.
  *
- * When a proxy function internally calls other functions that may re-enter
- * the hooked function (e.g., hooking strlen, and the proxy calls snprintf
- * which calls strlen again), use this macro to prevent infinite recursion.
- *
- * Usage in C++ proxy function:
- *
- *   static size_t my_strlen_hook(const char *s) {
- *       ADL_HOOK_CALL_GUARD(orig_strlen, s);  // if recursive, call orig and return
- *       // ... your logic (may call functions that use strlen internally) ...
+ * Example:
+ *   static size_t (*orig_strlen)(const char *) = NULL;
+ *   static size_t my_strlen(const char *s) {
+ *       // No guard needed! Hub handles recursion automatically.
+ *       // snprintf below may call strlen internally — hub will bypass proxy.
+ *       char buf[64];
+ *       snprintf(buf, sizeof(buf), "strlen called for %p", s);
  *       return orig_strlen(s) + 42;
  *   }
- *
- * ADL_HOOK_CALL_GUARD checks a thread-local recursion flag. If already inside
- * this proxy, it calls the original function directly and returns immediately.
- * The flag is automatically cleared when the proxy function returns normally.
+ *   adl_inline_hook(target, my_strlen, (void**)&orig_strlen);
  */
-
-struct _adl_hook_guard_t {
-    int &depth;
-    _adl_hook_guard_t(int &d) : depth(d) { depth++; }
-    ~_adl_hook_guard_t() { depth--; }
-};
-
-#define ADL_HOOK_CALL_GUARD(orig_fn, ...) \
-    static __thread int _adl_guard_depth_##orig_fn = 0; \
-    if (_adl_guard_depth_##orig_fn > 0) { \
-        return (orig_fn)(__VA_ARGS__); \
-    } \
-    _adl_hook_guard_t _adl_guard_instance_##orig_fn(_adl_guard_depth_##orig_fn)
 
 /**
  * PLT/GOT hook: replace a PLT call in caller_lib to target_func with new_func.

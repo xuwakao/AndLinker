@@ -9,6 +9,7 @@
 #include <android/log.h>
 
 #include "adl_hook.h"
+#include "adl_hub.h"
 #include "adl_relocate.h"
 
 #define HOOKER_TAG "adl_hooker"
@@ -38,6 +39,8 @@ struct inline_hook_record {
     uint8_t orig_bytes[64];
     void *trampoline;
     bool is_thumb;
+    adl_hub_data_t *hub_data;  // hub data (owns lifecycle)
+    void *hub_entry;           // hub code entry point
     inline_hook_record *next;
 };
 
@@ -228,21 +231,41 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
         return -1;
     }
 
-    // Write hook with ordered writes (thread-safe)
-    ordered_write_hook(target_func, new_func, hook_size, is_thumb);
-
-    // Return trampoline
-    if (orig_func != NULL) {
+    // Set up trampoline pointer for orig_func
+    void *trampoline_for_caller = trampoline;
 #if defined(__arm__)
-        if (is_thumb) {
-            *orig_func = reinterpret_cast<void *>(
-                reinterpret_cast<uintptr_t>(trampoline) | 1);
-        } else {
-            *orig_func = trampoline;
-        }
-#else
-        *orig_func = trampoline;
+    if (is_thumb) {
+        trampoline_for_caller = reinterpret_cast<void *>(
+            reinterpret_cast<uintptr_t>(trampoline) | 1);
+    }
 #endif
+
+    // Create hub for automatic recursion prevention
+    adl_hub_data_t *hub_data = new adl_hub_data_t();
+    hub_data->orig_addr = target_func;
+    hub_data->proxy_func = new_func;
+    hub_data->trampoline = trampoline_for_caller;
+
+    void *hub_entry = adl_hub_create(hub_data);
+    void *jump_target;
+
+    if (hub_entry != NULL) {
+        // Hub available: target jumps to hub, hub manages proxy/trampoline dispatch
+        jump_target = hub_entry;
+        HLOGI("Inline hook with hub: %p -> hub@%p -> proxy@%p (trampoline@%p)",
+              target_func, hub_entry, new_func, trampoline);
+    } else {
+        // Hub not available (non-ARM64): fall back to direct jump to proxy
+        jump_target = new_func;
+        HLOGW("Inline hook without hub (no recursion guard): %p -> %p", target_func, new_func);
+    }
+
+    // Write hook with ordered writes (thread-safe)
+    ordered_write_hook(target_func, jump_target, hook_size, is_thumb);
+
+    // Return trampoline to caller
+    if (orig_func != NULL) {
+        *orig_func = trampoline_for_caller;
     }
 
     // Save record
@@ -252,11 +275,11 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
     memcpy(record->orig_bytes, orig_bytes, hook_size);
     record->trampoline = trampoline;
     record->is_thumb = is_thumb;
+    record->hub_data = hub_data;
+    record->hub_entry = hub_entry;
     record->next = g_inline_hooks;
     g_inline_hooks = record;
 
-    HLOGI("Inline hook: %p -> %p (trampoline@%p, size=%zu, thumb=%d)",
-          target_func, new_func, trampoline, hook_size, is_thumb);
     return 0;
 }
 

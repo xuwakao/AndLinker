@@ -826,30 +826,29 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
-    // 22. Inline hook: __strlen_chk (hook the FORTIFY wrapper, not raw strlen)
-    // Reason: if we hook raw strlen, __strlen_chk calls it, gets +42, then
-    // FORTIFY check fails (ret >= bos) and aborts. By hooking __strlen_chk
-    // directly, we intercept BEFORE the FORTIFY check.
-    g_result += "\n--- Inline hook: __strlen_chk ---\n";
+    // 22. Inline hook: strlen — with hub auto-recursion prevention
+    // Hub ensures: when proxy internally triggers strlen (via result_pass → g_result +=),
+    // the recursive call goes to the original function, not the proxy again.
+    g_result += "\n--- Inline hook: strlen (hub) ---\n";
     {
-        typedef size_t (*strlen_chk_fn)(const char *, size_t);
-        static strlen_chk_fn orig_strlen_chk = NULL;
+        typedef size_t (*strlen_fn)(const char *);
+        static strlen_fn orig_strlen_fn = NULL;
 
-        struct strlen_chk_hook {
-            static size_t hooked_strlen_chk(const char *s, size_t bos) {
-                ADL_HOOK_CALL_GUARD(orig_strlen_chk, s, bos);
-                return orig_strlen_chk(s, bos) + 42;
+        struct strlen_hook {
+            static size_t hooked_strlen(const char *s) {
+                // No guard needed — hub handles recursion automatically!
+                return orig_strlen_fn(s) + 42;
             }
         };
 
         void *handle = adlopen(BASENAME_LIBC, 0);
-        void *target = handle ? adlsym(handle, "__strlen_chk") : NULL;
+        void *target = handle ? adlsym(handle, "strlen") : NULL;
         if (target != NULL) {
             int ret = adl_inline_hook(target,
-                                      reinterpret_cast<void *>(strlen_chk_hook::hooked_strlen_chk),
-                                      reinterpret_cast<void **>(&orig_strlen_chk));
+                                      reinterpret_cast<void *>(strlen_hook::hooked_strlen),
+                                      reinterpret_cast<void **>(&orig_strlen_fn));
             if (ret == 0) {
-                result_pass("adl_inline_hook(__strlen_chk) installed at %p", target);
+                result_pass("adl_inline_hook(strlen) installed at %p", target);
 
                 char test[] = "hello";
                 volatile size_t hooked_len = strlen(test);
@@ -860,7 +859,7 @@ static void adl_test() {
                 }
 
                 adl_inline_unhook(target);
-                result_pass("adl_inline_unhook(__strlen_chk) restored");
+                result_pass("adl_inline_unhook(strlen) restored");
                 volatile size_t restored = strlen(test);
                 if (restored == 5) {
                     result_pass("unhooked: strlen(\"hello\") = %zu (correct)", (size_t)restored);
@@ -868,10 +867,10 @@ static void adl_test() {
                     result_fail("unhooked: strlen(\"hello\") = %zu, expected 5", (size_t)restored);
                 }
             } else {
-                result_fail("adl_inline_hook(__strlen_chk) failed");
+                result_fail("adl_inline_hook(strlen) failed");
             }
         } else {
-            result_fail("adlsym(__strlen_chk) not found");
+            result_fail("adlsym(strlen) not found");
         }
         if (handle) adlclose(handle);
     }
