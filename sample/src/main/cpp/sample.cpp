@@ -6,8 +6,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <string.h>
-#include <errno.h>
+#include <cerrno>
 
 #include "adl.h"
 #include "adl_hook.h"
@@ -719,7 +718,7 @@ static void adl_test() {
         }
     }
 
-    // 20. Inline hook: hook localtime to shift year +100
+    // 20. Inline hook: localtime
     g_result += "\n--- Inline hook: localtime ---\n";
     {
         typedef struct tm *(*localtime_fn)(const time_t *);
@@ -731,14 +730,7 @@ static void adl_test() {
             static struct tm *hooked_localtime(const time_t *timep) {
                 struct tm *result = orig_localtime(timep);
                 if (result != NULL) {
-                    char buf[128];
-                    snprintf(buf, sizeof(buf),
-                             "  >> localtime: original year=%d\n", result->tm_year + 1900);
-                    *lt_log += buf;
-                    result->tm_year += 100; // +100 years
-                    snprintf(buf, sizeof(buf),
-                             "  << localtime: modified year=%d\n", result->tm_year + 1900);
-                    *lt_log += buf;
+                    result->tm_year += 100; // +100 years, no string ops
                 }
                 return result;
             }
@@ -782,7 +774,7 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
-    // 21. Inline hook: hook atoi to return modified value
+    // 21. Inline hook: atoi
     g_result += "\n--- Inline hook: atoi ---\n";
     {
         typedef int (*atoi_fn)(const char *);
@@ -830,6 +822,118 @@ static void adl_test() {
             }
         } else {
             result_fail("adlsym(atoi) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 22. Inline hook: __strlen_chk (hook the FORTIFY wrapper, not raw strlen)
+    // Reason: if we hook raw strlen, __strlen_chk calls it, gets +42, then
+    // FORTIFY check fails (ret >= bos) and aborts. By hooking __strlen_chk
+    // directly, we intercept BEFORE the FORTIFY check.
+    g_result += "\n--- Inline hook: __strlen_chk ---\n";
+    {
+        typedef size_t (*strlen_chk_fn)(const char *, size_t);
+        static strlen_chk_fn orig_strlen_chk = NULL;
+
+        struct strlen_chk_hook {
+            static size_t hooked_strlen_chk(const char *s, size_t bos) {
+                ADL_HOOK_CALL_GUARD(orig_strlen_chk, s, bos);
+                return orig_strlen_chk(s, bos) + 42;
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "__strlen_chk") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(strlen_chk_hook::hooked_strlen_chk),
+                                      reinterpret_cast<void **>(&orig_strlen_chk));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(__strlen_chk) installed at %p", target);
+
+                char test[] = "hello";
+                volatile size_t hooked_len = strlen(test);
+                if (hooked_len == 5 + 42) {
+                    result_pass("hooked: strlen(\"hello\") = %zu (+42)", (size_t)hooked_len);
+                } else {
+                    result_fail("hooked: strlen(\"hello\") = %zu, expected 47", (size_t)hooked_len);
+                }
+
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(__strlen_chk) restored");
+                volatile size_t restored = strlen(test);
+                if (restored == 5) {
+                    result_pass("unhooked: strlen(\"hello\") = %zu (correct)", (size_t)restored);
+                } else {
+                    result_fail("unhooked: strlen(\"hello\") = %zu, expected 5", (size_t)restored);
+                }
+            } else {
+                result_fail("adl_inline_hook(__strlen_chk) failed");
+            }
+        } else {
+            result_fail("adlsym(__strlen_chk) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 23. Inline hook: open (minimal hook, no LOG/malloc to avoid recursion)
+    g_result += "\n--- Inline hook: open ---\n";
+    {
+        typedef int (*open_fn)(const char *, int, ...);
+        static open_fn orig_open_fn = NULL;
+        static volatile int open_hook_count;
+        open_hook_count = 0;
+
+        struct open_hook {
+            static int hooked_open(const char *path, int flags, ...) {
+                open_hook_count++;
+                return orig_open_fn(path, flags);
+            }
+        };
+
+        // FORTIFY replaces open() with __open_2, so hook that instead
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "__open_2") : NULL;
+        if (target == NULL && handle) {
+            // fallback to open if __open_2 not found
+            target = adlsym(handle, "open");
+        }
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(open_hook::hooked_open),
+                                      reinterpret_cast<void **>(&orig_open_fn));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(__open_2/open) installed at %p", target);
+                open_hook_count = 0;
+                int fd = open("/proc/self/maps", O_RDONLY);
+                if (fd >= 0 && open_hook_count > 0) {
+                    result_pass("hooked: open() intercepted (count=%d, fd=%d)",
+                                (int)open_hook_count, fd);
+                    close(fd);
+                } else if (fd >= 0) {
+                    result_fail("hooked: open() not intercepted (count=%d)",
+                                (int)open_hook_count);
+                    close(fd);
+                } else {
+                    result_fail("hooked: open() failed errno=%d", errno);
+                }
+
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(__open_2/open) restored");
+                open_hook_count = 0;
+                int fd2 = open("/proc/self/maps", O_RDONLY);
+                if (fd2 >= 0 && open_hook_count == 0) {
+                    result_pass("unhooked: open() not intercepted (correct)");
+                    close(fd2);
+                } else {
+                    result_fail("unhooked: count=%d fd=%d", (int)open_hook_count, fd2);
+                    if (fd2 >= 0) close(fd2);
+                }
+            } else {
+                result_fail("adl_inline_hook(__open_2/open) failed");
+            }
+        } else {
+            result_fail("adlsym(__open_2/open) not found");
         }
         if (handle) adlclose(handle);
     }

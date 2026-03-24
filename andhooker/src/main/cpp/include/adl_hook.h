@@ -10,6 +10,39 @@
 __BEGIN_DECLS
 
 /**
+ * Recursion guard for inline hook proxy functions.
+ *
+ * When a proxy function internally calls other functions that may re-enter
+ * the hooked function (e.g., hooking strlen, and the proxy calls snprintf
+ * which calls strlen again), use this macro to prevent infinite recursion.
+ *
+ * Usage in C++ proxy function:
+ *
+ *   static size_t my_strlen_hook(const char *s) {
+ *       ADL_HOOK_CALL_GUARD(orig_strlen, s);  // if recursive, call orig and return
+ *       // ... your logic (may call functions that use strlen internally) ...
+ *       return orig_strlen(s) + 42;
+ *   }
+ *
+ * ADL_HOOK_CALL_GUARD checks a thread-local recursion flag. If already inside
+ * this proxy, it calls the original function directly and returns immediately.
+ * The flag is automatically cleared when the proxy function returns normally.
+ */
+
+struct _adl_hook_guard_t {
+    int &depth;
+    _adl_hook_guard_t(int &d) : depth(d) { depth++; }
+    ~_adl_hook_guard_t() { depth--; }
+};
+
+#define ADL_HOOK_CALL_GUARD(orig_fn, ...) \
+    static __thread int _adl_guard_depth_##orig_fn = 0; \
+    if (_adl_guard_depth_##orig_fn > 0) { \
+        return (orig_fn)(__VA_ARGS__); \
+    } \
+    _adl_hook_guard_t _adl_guard_instance_##orig_fn(_adl_guard_depth_##orig_fn)
+
+/**
  * PLT/GOT hook: replace a PLT call in caller_lib to target_func with new_func.
  *
  * @param caller_lib  Library name or path whose GOT will be patched (e.g. "libsample.so")

@@ -191,6 +191,11 @@ extern "C" size_t adl_build_trampoline(void *target, size_t hook_size, bool is_t
     size_t out_offset = 0;
     size_t num_insns = hook_size / 4;
 
+    // Prepend BTI c (0xD503245F) so trampoline can be called via indirect branch
+    uint32_t *bti_out = reinterpret_cast<uint32_t *>(trampoline);
+    bti_out[0] = 0xD503245F; // bti c
+    out_offset += 4;
+
     for (size_t i = 0; i < num_insns; i++) {
         uint64_t tramp_pc = reinterpret_cast<uint64_t>(trampoline) + out_offset;
         RLOGI("relocate insn[%zu]: 0x%08x @ PC=0x%llx -> tramp@0x%llx",

@@ -164,6 +164,18 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
 
 #if defined(__aarch64__)
     min_hook_size = HOOK_MIN_SIZE;
+    // ARM64 BTI: if first instruction is HINT (BTI variant), skip it
+    // BTI insns: 0xD503245F (bti c), 0xD503247F (bti j), 0xD50324DF (bti jc), 0xD503201F (nop/hint)
+    {
+        uint32_t first_insn = *reinterpret_cast<uint32_t *>(target_func);
+        if ((first_insn & 0xFFFFFF1F) == 0xD503241F || // bti c/j/jc
+            first_insn == 0xD503245F) {                  // bti c specifically
+            HLOGI("ARM64 BTI detected at %p (insn=0x%08x), hooking after BTI",
+                  target_func, first_insn);
+            target_func = reinterpret_cast<void *>(
+                reinterpret_cast<uintptr_t>(target_func) + 4);
+        }
+    }
 #elif defined(__arm__)
     uintptr_t target_addr = reinterpret_cast<uintptr_t>(target_func);
     is_thumb = (target_addr & 1) != 0;
@@ -265,7 +277,8 @@ int adl_inline_unhook(void *target_func) {
             // Ordered unhook write
             ordered_write_unhook(target_func, record->orig_bytes, record->hook_size);
 
-            munmap(record->trampoline, PAGE_SIZE);
+            // Do NOT munmap trampoline — JIT or other threads may still reference it.
+            // The 4KB page will be reclaimed when the process exits.
             *pp = record->next;
             delete record;
 
