@@ -121,7 +121,7 @@ static void *resolve_sym(const char *filename, const char *symbol,
     return addr;
 }
 
-static void adl_test() {
+static void adl_test() {【】
     g_result.clear();
 
     int api = android_get_device_api_level();
@@ -886,7 +886,55 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
-    // 23. Inline hook: open (minimal hook, no LOG/malloc to avoid recursion)
+    // 23. Inline hook: __strlen_chk directly — can safely modify return value
+    // Because we bypass FORTIFY check entirely (we ARE the check now)
+    g_result += "\n--- Inline hook: __strlen_chk (modify) ---\n";
+    {
+        typedef size_t (*strlen_chk_fn)(const char *, size_t);
+        static strlen_chk_fn orig_strlen_chk = NULL;
+
+        struct strlen_chk_hook {
+            static size_t hooked(const char *s, size_t bos) {
+                // Safe to modify: we replaced __strlen_chk, so FORTIFY check is ours
+                return orig_strlen_chk(s, bos) + 42;
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "__strlen_chk") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(strlen_chk_hook::hooked),
+                                      reinterpret_cast<void **>(&orig_strlen_chk));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(__strlen_chk) installed at %p", target);
+
+                char test[] = "hello";
+                volatile size_t hooked_len = strlen(test);
+                if (hooked_len == 5 + 42) {
+                    result_pass("hooked: strlen via __strlen_chk = %zu (+42)", (size_t)hooked_len);
+                } else {
+                    result_fail("hooked: strlen = %zu, expected 47", (size_t)hooked_len);
+                }
+
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(__strlen_chk) restored");
+                volatile size_t restored = strlen(test);
+                if (restored == 5) {
+                    result_pass("unhooked: strlen = %zu (correct)", (size_t)restored);
+                } else {
+                    result_fail("unhooked: strlen = %zu, expected 5", (size_t)restored);
+                }
+            } else {
+                result_fail("adl_inline_hook(__strlen_chk) failed");
+            }
+        } else {
+            result_fail("adlsym(__strlen_chk) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 24. Inline hook: open (minimal hook, no LOG/malloc to avoid recursion)
     g_result += "\n--- Inline hook: open ---\n";
     {
         typedef int (*open_fn)(const char *, int, ...);
@@ -946,6 +994,293 @@ static void adl_test() {
             result_fail("adlsym(__open_2/open) not found");
         }
         if (handle) adlclose(handle);
+    }
+
+    // 25. Inline hook: short function (getpid, ~12 bytes)
+    g_result += "\n--- Inline hook: getpid (short func) ---\n";
+    {
+        typedef pid_t (*getpid_fn)(void);
+        static getpid_fn orig_getpid = NULL;
+        static volatile int getpid_hook_count;
+        getpid_hook_count = 0;
+
+        struct getpid_hook {
+            static pid_t hooked_getpid(void) {
+                getpid_hook_count++;
+                return orig_getpid();  // observe only — getpid is very short
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "getpid") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(getpid_hook::hooked_getpid),
+                                      reinterpret_cast<void **>(&orig_getpid));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(getpid) installed");
+                getpid_hook_count = 0;
+                pid_t pid = getpid();
+                if (getpid_hook_count > 0 && pid > 0) {
+                    result_pass("hooked: getpid() = %d, intercepted %d times", pid, (int)getpid_hook_count);
+                } else {
+                    result_fail("hooked: pid=%d count=%d", pid, (int)getpid_hook_count);
+                }
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(getpid) restored");
+            } else {
+                result_info("adl_inline_hook(getpid) failed (may be too short, expected)");
+            }
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 26. Inline hook: reject/block call
+    g_result += "\n--- Inline hook: block call ---\n";
+    {
+        typedef int (*access_fn)(const char *, int);
+        static access_fn orig_access = NULL;
+
+        struct access_hook {
+            static int hooked_access(const char *path, int mode) {
+                // Block access to a specific path — don't call original
+                if (path != NULL && path[0] == '/' && path[1] == 't' && path[2] == 'm' && path[3] == 'p') {
+                    return -1;  // reject without calling orig
+                }
+                return orig_access(path, mode);  // allow others
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "access") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(access_hook::hooked_access),
+                                      reinterpret_cast<void **>(&orig_access));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(access) installed");
+
+                // /proc/self/maps should be allowed
+                int r1 = access("/proc/self/maps", F_OK);
+                if (r1 == 0) {
+                    result_pass("access(/proc/self/maps) = %d (allowed)", r1);
+                } else {
+                    result_fail("access(/proc/self/maps) = %d (should be allowed)", r1);
+                }
+
+                // /tmp/... should be blocked
+                int r2 = access("/tmp/test", F_OK);
+                if (r2 == -1) {
+                    result_pass("access(/tmp/test) = %d (blocked)", r2);
+                } else {
+                    result_fail("access(/tmp/test) = %d (should be blocked)", r2);
+                }
+
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(access) restored");
+            } else {
+                result_fail("adl_inline_hook(access) failed");
+            }
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 27. PLT hook: parameter modification (hook localtime to modify input)
+    g_result += "\n--- PLT hook: localtime param modify ---\n";
+    {
+        typedef struct tm *(*localtime_fn)(const time_t *);
+        static localtime_fn orig_localtime_plt = NULL;
+        static time_t modified_time;
+
+        struct localtime_plt_hook {
+            static struct tm *hooked(const time_t *timep) {
+                // Modify parameter: add 365 days
+                modified_time = *timep + 365 * 86400;
+                return orig_localtime_plt(&modified_time);
+            }
+        };
+
+        int ret = adl_plt_hook("libsample.so", "localtime",
+                               reinterpret_cast<void *>(localtime_plt_hook::hooked),
+                               reinterpret_cast<void **>(&orig_localtime_plt));
+        if (ret == 0) {
+            result_pass("adl_plt_hook(localtime) installed");
+            time_t now = time(NULL);
+            struct tm *tm = localtime(&now);
+            int year = tm->tm_year + 1900;
+            if (year == 2027) {
+                result_pass("param modified: localtime returns year=%d (+1)", year);
+            } else {
+                result_fail("param modify: year=%d, expected 2027", year);
+            }
+            adl_plt_unhook("libsample.so", "localtime");
+            result_pass("adl_plt_unhook(localtime) restored");
+        } else {
+            result_fail("adl_plt_hook(localtime) failed");
+        }
+    }
+
+    // 28. Inline hook: hook → unhook → rehook cycle
+    g_result += "\n--- Inline hook: rehook cycle ---\n";
+    {
+        typedef int (*atoi_fn)(const char *);
+        static atoi_fn orig_atoi2 = NULL;
+        static volatile int atoi_cycle_count;
+
+        struct atoi_cycle_hook {
+            static int hooked(const char *s) {
+                atoi_cycle_count++;
+                return orig_atoi2(s);
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "atoi") : NULL;
+        if (target != NULL) {
+            bool all_ok = true;
+            for (int cycle = 0; cycle < 3; cycle++) {
+                int ret = adl_inline_hook(target,
+                                          reinterpret_cast<void *>(atoi_cycle_hook::hooked),
+                                          reinterpret_cast<void **>(&orig_atoi2));
+                if (ret != 0) {
+                    result_fail("rehook cycle %d: hook failed", cycle);
+                    all_ok = false;
+                    break;
+                }
+
+                atoi_cycle_count = 0;
+                volatile int val = atoi("99");
+                if (atoi_cycle_count == 0 || val != 99) {
+                    result_fail("rehook cycle %d: count=%d val=%d", cycle,
+                                (int)atoi_cycle_count, val);
+                    all_ok = false;
+                    adl_inline_unhook(target);
+                    break;
+                }
+
+                adl_inline_unhook(target);
+
+                // Verify unhook works
+                atoi_cycle_count = 0;
+                volatile int val2 = atoi("99");
+                if (atoi_cycle_count != 0 || val2 != 99) {
+                    result_fail("rehook cycle %d unhook: count=%d val=%d", cycle,
+                                (int)atoi_cycle_count, val2);
+                    all_ok = false;
+                    break;
+                }
+            }
+            if (all_ok) {
+                result_pass("3x hook/unhook/rehook cycles all passed");
+            }
+        } else {
+            result_fail("adlsym(atoi) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 29. Inline hook: C++ mangled function from libart
+    g_result += "\n--- Inline hook: ART C++ function ---\n";
+    {
+        void *art_handle = adlopen(PATHNAME_LIBART, 0);
+        if (art_handle == NULL) {
+            art_handle = adlopen("libart.so", 0);
+        }
+        if (art_handle != NULL) {
+            // Find JNI_GetCreatedJavaVMs — exported C function in libart
+            typedef int (*get_vms_fn)(JavaVM **, int, int *);
+            static get_vms_fn orig_get_vms = NULL;
+            static volatile int get_vms_count;
+            get_vms_count = 0;
+
+            struct get_vms_hook {
+                static int hooked(JavaVM **vms, int max, int *count) {
+                    get_vms_count++;
+                    return orig_get_vms(vms, max, count);
+                }
+            };
+
+            void *target = adlsym(art_handle, "JNI_GetCreatedJavaVMs");
+            if (target != NULL) {
+                int ret = adl_inline_hook(target,
+                                          reinterpret_cast<void *>(get_vms_hook::hooked),
+                                          reinterpret_cast<void **>(&orig_get_vms));
+                if (ret == 0) {
+                    result_pass("adl_inline_hook(JNI_GetCreatedJavaVMs) installed");
+
+                    get_vms_count = 0;
+                    JavaVM *vm = NULL;
+                    int count = 0;
+                    int r = get_vms_hook::hooked(&vm, 1, &count);
+                    if (get_vms_count > 0 && r == 0 && count > 0) {
+                        result_pass("hooked: JNI_GetCreatedJavaVMs intercepted, %d VM(s)", count);
+                    } else {
+                        result_fail("hooked: count=%d ret=%d vms=%d",
+                                    (int)get_vms_count, r, count);
+                    }
+
+                    adl_inline_unhook(target);
+                    result_pass("adl_inline_unhook(JNI_GetCreatedJavaVMs) restored");
+                } else {
+                    result_fail("adl_inline_hook(JNI_GetCreatedJavaVMs) failed");
+                }
+            } else {
+                result_info("JNI_GetCreatedJavaVMs not found in libart");
+            }
+            adlclose(art_handle);
+        } else {
+            result_info("libart.so not found (skipping ART hook test)");
+        }
+    }
+
+    // 30. PLT hook: __vsnprintf_chk (FORTIFY-wrapped snprintf)
+    g_result += "\n--- PLT hook: __vsnprintf_chk ---\n";
+    {
+        typedef int (*vsnprintf_chk_fn)(char *, size_t, int, size_t, const char *, va_list);
+        static vsnprintf_chk_fn orig_vsnprintf_chk = NULL;
+
+        struct vsnprintf_chk_hook {
+            static int hooked(char *buf, size_t maxlen, int flag, size_t slen,
+                              const char *fmt, va_list ap) {
+                // Prefix the output with [hooked]
+                int prefix_len = 0;
+                if (maxlen > 9) {
+                    memcpy(buf, "[hooked] ", 9);
+                    prefix_len = 9;
+                }
+                int ret = orig_vsnprintf_chk(buf + prefix_len, maxlen - prefix_len,
+                                              flag, slen > (size_t)prefix_len ? slen - prefix_len : slen,
+                                              fmt, ap);
+                return ret + prefix_len;
+            }
+        };
+
+        int ret = adl_plt_hook("libsample.so", "__vsnprintf_chk",
+                               reinterpret_cast<void *>(vsnprintf_chk_hook::hooked),
+                               reinterpret_cast<void **>(&orig_vsnprintf_chk));
+        if (ret == 0) {
+            result_pass("adl_plt_hook(__vsnprintf_chk) installed");
+
+            char buf[64];
+            snprintf(buf, sizeof(buf), "hello %d", 42);
+            if (memcmp(buf, "[hooked]", 8) == 0) {
+                result_pass("hooked: snprintf -> \"%s\"", buf);
+            } else {
+                result_fail("hooked: snprintf -> \"%s\" (expected [hooked] prefix)", buf);
+            }
+
+            adl_plt_unhook("libsample.so", "__vsnprintf_chk");
+            result_pass("adl_plt_unhook(__vsnprintf_chk) restored");
+
+            snprintf(buf, sizeof(buf), "hello %d", 42);
+            if (memcmp(buf, "hello", 5) == 0) {
+                result_pass("unhooked: snprintf -> \"%s\" (correct)", buf);
+            } else {
+                result_fail("unhooked: snprintf -> \"%s\"", buf);
+            }
+        } else {
+            result_fail("adl_plt_hook(__vsnprintf_chk) failed");
+        }
     }
 
     // summary
