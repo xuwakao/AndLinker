@@ -7,15 +7,18 @@ Android linker bypass library — access private/internal symbols in system shar
 - `adlopen` / `adlclose` — Open and close shared libraries, bypassing linker restrictions on Android 7.0+
 - `adlsym` — Resolve symbols (including private/internal ones) from loaded libraries
 - `adlvsym` — Resolve versioned symbols (Android 7.0+)
+- `adlsym_match` — Fuzzy symbol lookup with `__cxa_demangle` support (search by C++ readable name)
 - `adladdr` — Get symbol information for a given address (like `dladdr`)
+- `adlerror` — Get last error message (like `dlerror`)
 - `adl_iterate_phdr` — Iterate over program headers of all loaded libraries
+- `adl_enum_symbols` — Enumerate all symbols in a library (.dynsym + .symtab)
 
 ## Compatibility
 
 - **Minimum SDK**: API 21 (Android 5.0)
 - **Target SDK**: API 34 (Android 14)
 - **Architectures**: armeabi-v7a, arm64-v8a, x86, x86_64
-- **Tested on**: Android 6.0 — 11
+- **Tested on**: Android 6.0 — 16 (API 23 — 36)
 
 ## Usage
 
