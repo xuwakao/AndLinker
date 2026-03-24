@@ -69,11 +69,12 @@ All public APIs are protected by a recursive mutex, ensuring safe concurrent acc
 
 ### Integration
 
-Add the `andlinker` module to your project and declare a dependency:
+Add the modules to your project and declare dependencies:
 
 ```gradle
 dependencies {
-    implementation project(':andlinker')
+    implementation project(':andlinker')   // symbol resolution, linker bypass
+    implementation project(':andhooker')   // PLT hook + inline hook (depends on andlinker)
 }
 ```
 
