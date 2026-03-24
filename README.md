@@ -226,6 +226,8 @@ The hub is an assembly template (`adl_hub_arm64.S`) compiled by the assembler fo
 - Each thread stack holds up to 16 recursion frames
 - `pthread_key_t` for automatic cleanup on thread exit
 
+> **Note:** Hub is currently implemented for ARM64 only. On ARM32/x86/x86_64, inline hooks fall back to direct proxy jumps without automatic recursion prevention.
+
 #### 5. Thread-Safe Ordered Writes
 
 Hook installation uses ordered writes with memory barriers to prevent crashes from concurrent execution:
@@ -272,9 +274,9 @@ adl_inline_unhook(target);
 - Low-frequency functions: `gettimeofday`, `localtime`, `atoi`, `access`, etc.
 - Functions not called by system infrastructure (JIT, GC, malloc)
 
-**Unsafe to modify return values for:**
-- `strlen`, `memcpy`, `memset`, `malloc`, `free` — these are called by every thread including JIT/GC; modified return values corrupt heap
-- Any IFUNC function with FORTIFY wrapper — `__strlen_chk` validates strlen's return
+**Unsafe to modify return values for (via raw function inline hook):**
+- `strlen`, `memcpy`, `memset`, `malloc`, `free` — called by every thread including JIT/GC; modified return values corrupt heap across the entire process
+- Note: hooking `__strlen_chk` directly **is safe** because you replace the FORTIFY check itself
 
 **For high-frequency global functions:**
 - Use **PLT hook** (only affects one module) to safely modify return values
@@ -308,6 +310,10 @@ ARM64 inline hook overwrites 16 bytes at the function entry. Functions shorter t
 - Safety is preferred over relying on alignment assumptions
 
 For short functions, use **PLT hook** instead (no size restriction — only modifies a GOT pointer).
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.
 
 ## Build
 
