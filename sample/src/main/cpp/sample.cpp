@@ -6,8 +6,11 @@
 #include <time.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <string.h>
+#include <errno.h>
 
 #include "adl.h"
+#include "adl_hook.h"
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
@@ -500,6 +503,335 @@ static void adl_test() {
             for (int i = 0; i < NUM_THREADS; i++) if (!results[i].success) fail_count++;
             result_fail("%d threads: %d failed", NUM_THREADS, fail_count);
         }
+    }
+
+    // 16. PLT hook test — hook close() called from this module
+    g_result += "\n--- PLT hook: close ---\n";
+    {
+        typedef int (*close_fn)(int);
+        static close_fn orig_close = NULL;
+        static int close_hook_count;
+        close_hook_count = 0;
+
+        static std::string *hook_log;
+        hook_log = &g_result;
+
+        struct hook_helper {
+            static int hooked_close(int fd) {
+                close_hook_count++;
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  >> before close(fd=%d)\n", fd);
+                *hook_log += buf;
+                LOG("[PLT hook] >> before close(fd=%d)", fd);
+                int ret = orig_close(fd);
+                snprintf(buf, sizeof(buf), "  << after  close(fd=%d) = %d\n", fd, ret);
+                *hook_log += buf;
+                LOG("[PLT hook] << after close(fd=%d) = %d", fd, ret);
+                return ret;
+            }
+        };
+
+        int ret = adl_plt_hook("libsample.so", "close",
+                               reinterpret_cast<void *>(hook_helper::hooked_close),
+                               reinterpret_cast<void **>(&orig_close));
+        if (ret == 0) {
+            result_pass("adl_plt_hook(close) installed");
+
+            // Open and close a file — close should go through our hook
+            int fd = open("/proc/self/maps", O_RDONLY);
+            if (fd >= 0) {
+                close_hook_count = 0;
+                close(fd);
+                if (close_hook_count == 1) {
+                    result_pass("hooked: close() intercepted (count=%d)", close_hook_count);
+                } else {
+                    result_fail("hooked: close() count=%d, expected 1", close_hook_count);
+                }
+            }
+
+            ret = adl_plt_unhook("libsample.so", "close");
+            if (ret == 0) {
+                result_pass("adl_plt_unhook(close) restored");
+                int fd2 = open("/proc/self/maps", O_RDONLY);
+                if (fd2 >= 0) {
+                    close_hook_count = 0;
+                    close(fd2);
+                    if (close_hook_count == 0) {
+                        result_pass("unhooked: close() not intercepted (correct)");
+                    } else {
+                        result_fail("unhooked: close() still intercepted count=%d", close_hook_count);
+                    }
+                }
+            } else {
+                result_fail("adl_plt_unhook failed");
+            }
+        } else {
+            result_fail("adl_plt_hook(close) failed");
+        }
+    }
+
+    // 17. Inline hook test — hook gettimeofday (safe, no recursion risk)
+    g_result += "\n--- Inline hook: gettimeofday ---\n";
+    {
+        typedef int (*gettimeofday_fn)(struct timeval *, struct timezone *);
+        static gettimeofday_fn orig_gettimeofday = NULL;
+        static std::string *hook_log2;
+        hook_log2 = &g_result;
+
+        struct hook_helper2 {
+            static int hooked_gettimeofday(struct timeval *tv, struct timezone *tz) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  >> before gettimeofday()\n");
+                *hook_log2 += buf;
+                int ret = orig_gettimeofday(tv, tz);
+                snprintf(buf, sizeof(buf), "  << after  gettimeofday() = %d, sec=%ld\n",
+                         ret, tv ? (long)tv->tv_sec : 0);
+                *hook_log2 += buf;
+                // Add 1 day to verify we can modify results
+                if (ret == 0 && tv != NULL) {
+                    tv->tv_sec += 86400;
+                }
+                return ret;
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "gettimeofday") : NULL;
+        if (target != NULL) {
+            // Get real time first
+            struct timeval before;
+            gettimeofday(&before, NULL);
+
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(hook_helper2::hooked_gettimeofday),
+                                      reinterpret_cast<void **>(&orig_gettimeofday));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(gettimeofday) installed");
+
+                struct timeval after;
+                gettimeofday(&after, NULL);
+                long diff = after.tv_sec - before.tv_sec;
+                if (diff >= 86000) {
+                    result_pass("hooked: time shifted +%ld seconds (1 day)", diff);
+                } else {
+                    result_fail("hooked: expected +86400s, got +%ld", diff);
+                }
+
+                ret = adl_inline_unhook(target);
+                if (ret == 0) {
+                    result_pass("adl_inline_unhook(gettimeofday) restored");
+                    struct timeval restored;
+                    gettimeofday(&restored, NULL);
+                    long diff2 = restored.tv_sec - before.tv_sec;
+                    if (diff2 < 100) {
+                        result_pass("unhooked: time normal +%ld seconds", diff2);
+                    } else {
+                        result_fail("unhooked: still shifted +%ld", diff2);
+                    }
+                } else {
+                    result_fail("adl_inline_unhook failed");
+                }
+            } else {
+                result_fail("adl_inline_hook(gettimeofday) failed");
+            }
+        } else {
+            result_fail("adlsym(gettimeofday) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 18. PLT hook: intercept __android_log_print to count log calls
+    g_result += "\n--- PLT hook: __android_log_print ---\n";
+    {
+        typedef int (*log_fn)(int, const char *, const char *, ...);
+        static log_fn orig_log = NULL;
+        static int log_count;
+        log_count = 0;
+
+        struct log_hook {
+            static int hooked_log(int prio, const char *tag, const char *fmt, ...) {
+                log_count++;
+                va_list args;
+                va_start(args, fmt);
+                int ret = __android_log_vprint(prio, tag, fmt, args);
+                va_end(args);
+                return ret;
+            }
+        };
+
+        int ret = adl_plt_hook("libsample.so", "__android_log_print",
+                               reinterpret_cast<void *>(log_hook::hooked_log),
+                               reinterpret_cast<void **>(&orig_log));
+        if (ret == 0) {
+            result_pass("adl_plt_hook(__android_log_print) installed");
+            log_count = 0;
+            LOG("test log 1");
+            LOG("test log 2");
+            LOG("test log 3");
+            if (log_count == 3) {
+                result_pass("hooked: intercepted %d log calls", log_count);
+            } else {
+                result_fail("hooked: expected 3 log calls, got %d", log_count);
+            }
+            adl_plt_unhook("libsample.so", "__android_log_print");
+            result_pass("adl_plt_unhook(__android_log_print) restored");
+        } else {
+            result_fail("adl_plt_hook(__android_log_print) failed");
+        }
+    }
+
+    // 19. PLT hook: modify memcmp return to always match
+    g_result += "\n--- PLT hook: memcmp ---\n";
+    {
+        typedef int (*memcmp_fn)(const void *, const void *, size_t);
+        static memcmp_fn orig_memcmp = NULL;
+
+        struct memcmp_hook {
+            static int hooked_memcmp(const void *a, const void *b, size_t n) {
+                (void)a; (void)b; (void)n;
+                return 0; // always "equal"
+            }
+        };
+
+        int ret = adl_plt_hook("libsample.so", "memcmp",
+                               reinterpret_cast<void *>(memcmp_hook::hooked_memcmp),
+                               reinterpret_cast<void **>(&orig_memcmp));
+        if (ret == 0) {
+            result_pass("adl_plt_hook(memcmp) installed");
+            // Use volatile to prevent compiler from optimizing away the call
+            volatile const char *a = "hello";
+            volatile const char *b = "world";
+            int cmp = memcmp(const_cast<const char*>(a), const_cast<const char*>(b), 5);
+            if (cmp == 0) {
+                result_pass("hooked: memcmp(\"hello\",\"world\") = 0 (forced equal)");
+            } else {
+                result_fail("hooked: memcmp returned %d, expected 0", cmp);
+            }
+            adl_plt_unhook("libsample.so", "memcmp");
+            cmp = memcmp(const_cast<const char*>(a), const_cast<const char*>(b), 5);
+            if (cmp != 0) {
+                result_pass("unhooked: memcmp(\"hello\",\"world\") = %d (correct)", cmp);
+            } else {
+                result_fail("unhooked: memcmp still returns 0");
+            }
+        } else {
+            result_fail("adl_plt_hook(memcmp) failed");
+        }
+    }
+
+    // 20. Inline hook: hook localtime to shift year +100
+    g_result += "\n--- Inline hook: localtime ---\n";
+    {
+        typedef struct tm *(*localtime_fn)(const time_t *);
+        static localtime_fn orig_localtime = NULL;
+        static std::string *lt_log;
+        lt_log = &g_result;
+
+        struct lt_hook {
+            static struct tm *hooked_localtime(const time_t *timep) {
+                struct tm *result = orig_localtime(timep);
+                if (result != NULL) {
+                    char buf[128];
+                    snprintf(buf, sizeof(buf),
+                             "  >> localtime: original year=%d\n", result->tm_year + 1900);
+                    *lt_log += buf;
+                    result->tm_year += 100; // +100 years
+                    snprintf(buf, sizeof(buf),
+                             "  << localtime: modified year=%d\n", result->tm_year + 1900);
+                    *lt_log += buf;
+                }
+                return result;
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "localtime") : NULL;
+        if (target != NULL) {
+            time_t now = time(NULL);
+            struct tm *before = localtime(&now);
+            int real_year = before->tm_year + 1900;
+
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(lt_hook::hooked_localtime),
+                                      reinterpret_cast<void **>(&orig_localtime));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(localtime) installed");
+                struct tm *after = localtime(&now);
+                int hooked_year = after->tm_year + 1900;
+                if (hooked_year == real_year + 100) {
+                    result_pass("hooked: year=%d (real=%d, +100)", hooked_year, real_year);
+                } else {
+                    result_fail("hooked: year=%d, expected %d", hooked_year, real_year + 100);
+                }
+
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(localtime) restored");
+                struct tm *restored = localtime(&now);
+                if (restored->tm_year + 1900 == real_year) {
+                    result_pass("unhooked: year=%d (correct)", restored->tm_year + 1900);
+                } else {
+                    result_fail("unhooked: year=%d, expected %d",
+                                restored->tm_year + 1900, real_year);
+                }
+            } else {
+                result_fail("adl_inline_hook(localtime) failed");
+            }
+        } else {
+            result_fail("adlsym(localtime) not found");
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 21. Inline hook: hook atoi to return modified value
+    g_result += "\n--- Inline hook: atoi ---\n";
+    {
+        typedef int (*atoi_fn)(const char *);
+        static atoi_fn orig_atoi = NULL;
+        static std::string *atoi_log;
+        atoi_log = &g_result;
+
+        struct atoi_hook {
+            static int hooked_atoi(const char *s) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "  >> before atoi(\"%s\")\n", s);
+                *atoi_log += buf;
+                int ret = orig_atoi(s);
+                snprintf(buf, sizeof(buf), "  << after  atoi(\"%s\") = %d, returning %d\n",
+                         s, ret, ret * 2);
+                *atoi_log += buf;
+                return ret * 2; // double it
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "atoi") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(atoi_hook::hooked_atoi),
+                                      reinterpret_cast<void **>(&orig_atoi));
+            if (ret == 0) {
+                result_pass("adl_inline_hook(atoi) installed");
+                int val = atoi("123");
+                if (val == 246) {
+                    result_pass("hooked: atoi(\"123\") = %d (doubled)", val);
+                } else {
+                    result_fail("hooked: atoi(\"123\") = %d, expected 246", val);
+                }
+                adl_inline_unhook(target);
+                result_pass("adl_inline_unhook(atoi) restored");
+                int restored = atoi("123");
+                if (restored == 123) {
+                    result_pass("unhooked: atoi(\"123\") = %d (correct)", restored);
+                } else {
+                    result_fail("unhooked: atoi(\"123\") = %d, expected 123", restored);
+                }
+            } else {
+                result_fail("adl_inline_hook(atoi) failed");
+            }
+        } else {
+            result_fail("adlsym(atoi) not found");
+        }
+        if (handle) adlclose(handle);
     }
 
     // summary

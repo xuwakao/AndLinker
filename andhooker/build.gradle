@@ -1,15 +1,14 @@
 plugins {
-    id 'com.android.application'
+    id 'com.android.library'
     id 'kotlin-android'
 }
 
 apply from : "${rootDir}/gradle/module-config.gradle"
 
 android {
-    namespace 'com.owttwo.andlinker.sample'
+    namespace 'com.owttwo.andhooker'
 
     defaultConfig {
-        applicationId "com.owttwo.andlinker.sample"
         versionCode 1
         versionName "1.0"
     }
@@ -20,7 +19,6 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
-
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
@@ -31,13 +29,9 @@ android {
 
 dependencies {
     implementation project(':andlinker')
-    implementation project(':andhooker')
 
     implementation deps.module.kotlin_stdlib
     implementation deps.module.core_ktx
-    implementation deps.module.appcompat
-    implementation deps.module.material
-    implementation deps.module.constraint_layout
 
     testImplementation deps.module.test.junit
     androidTestImplementation deps.module.test.android_junit

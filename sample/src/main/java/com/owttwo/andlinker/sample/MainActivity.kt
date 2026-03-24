@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         init {
             System.loadLibrary("adl")
+            System.loadLibrary("adlhooker")
             System.loadLibrary("sample")
         }
     }
