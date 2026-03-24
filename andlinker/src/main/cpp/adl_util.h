@@ -113,7 +113,7 @@ static size_t adl_page_offset(off64_t offset) {
     return static_cast<size_t>(offset & (PAGE_SIZE - 1));
 }
 
-static bool adl_realpath_fd(int fd, const char *realpath) {
+static bool adl_realpath_fd(int fd, char *realpath) {
     // proc_self_fd needs to be large enough to hold "/proc/self/fd/" plus an
     // integer, plus the NULL terminator.
     char proc_self_fd[32];
@@ -122,12 +122,13 @@ static bool adl_realpath_fd(int fd, const char *realpath) {
     static char buf[PATH_MAX];
 
     snprintf(proc_self_fd, sizeof(proc_self_fd), "/proc/self/fd/%d", fd);
-    auto length = readlink(proc_self_fd, buf, sizeof(buf));
+    auto length = readlink(proc_self_fd, buf, sizeof(buf) - 1);
     if (length == -1) {
         return false;
     }
 
-    memcpy((void *) realpath, buf, length);
+    memcpy(realpath, buf, length);
+    realpath[length] = '\0';
     return true;
 }
 
@@ -259,14 +260,7 @@ static size_t adl_phdr_table_get_load_size(const ElfW(Phdr) *phdr_table,
 }
 
 static FILE *adl_maps_open_reset() {
-    FILE *maps = NULL;
-    if (maps == NULL) {
-        maps = fopen(SELF_MAPS_PATH, "re");
-        if (maps == NULL)
-            return NULL;
-    }
-    fseeko(maps, 0, SEEK_SET);
-    return maps;
+    return fopen(SELF_MAPS_PATH, "re");
 }
 
 static bool adl_read_path_by_base(uintptr_t base,
@@ -368,6 +362,7 @@ static ElfW(Addr) adl_read_base_by_maps(const char *library) {
                               " ", &start, &offset))
             continue;
         if (0 != offset) continue;
+        fclose(maps);
         return start;
     }
     fclose(maps);

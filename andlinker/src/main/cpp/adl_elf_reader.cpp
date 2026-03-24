@@ -280,30 +280,40 @@ bool elf_reader::check_file_range(ElfW(Addr) offset,
 void elf_reader::recycle(void) {
     if (phdr_fragment_ != NULL) {
         phdr_fragment_->unmap();
+        free(phdr_fragment_);
+        phdr_fragment_ = NULL;
         phdr_table_ = NULL;
     }
 
     if (shdr_fragment_ != NULL) {
         shdr_fragment_->unmap();
+        free(shdr_fragment_);
+        shdr_fragment_ = NULL;
         shdr_table_ = NULL;
     }
 
     if (shstrtab_fragment_ != NULL) {
         shstrtab_fragment_->unmap();
+        free(shstrtab_fragment_);
+        shstrtab_fragment_ = NULL;
         shstrtab_ = NULL;
     }
 
     if (symtab_fragment_ != NULL) {
         symtab_fragment_->unmap();
+        free(symtab_fragment_);
+        symtab_fragment_ = NULL;
         symtab_ = NULL;
     }
 
     if (strtab_fragment_ != NULL) {
         strtab_fragment_->unmap();
+        free(strtab_fragment_);
+        strtab_fragment_ = NULL;
         strtab_ = NULL;
     }
 
-    if (fd_ != 1) {
+    if (fd_ != -1) {
         close(fd_);
         fd_ = -1;
     }

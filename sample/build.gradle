@@ -6,6 +6,8 @@ plugins {
 apply from : "${rootDir}/gradle/module-config.gradle"
 
 android {
+    namespace 'com.owttwo.andlinker.sample'
+
     defaultConfig {
         applicationId "com.owttwo.andlinker.sample"
         versionCode 1

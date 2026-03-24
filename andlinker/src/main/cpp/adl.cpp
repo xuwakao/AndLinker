@@ -295,23 +295,22 @@ ElfW(Versym) adl_find_verdef_version_index(const adl_so_info *si, const version_
 //  - If the requested version is not defined by the DSO, then verneed is kVersymGlobal, and only
 //    global symbol definitions match. (This special case is handled as part of the ordinary case
 //    where the version must match exactly.)
-// TODO : Not checked
 static inline bool check_symbol_version(const ElfW(Versym) *ver_table, uint32_t sym_idx,
                                         const ElfW(Versym) verneed) {
-    return true;
-//    if (ver_table == NULL) return true;
-//    const uint32_t verdef = ver_table[sym_idx];
-//    return (verneed == ADL_kVersymNotNeeded) ?
-//           !(verdef & ADL_kVersymHiddenBit) :
-//           verneed == (verdef & ~ADL_kVersymHiddenBit);
+    if (ver_table == NULL) return true;
+    const uint32_t verdef = ver_table[sym_idx];
+    return (verneed == ADL_kVersymNotNeeded) ?
+           !(verdef & ADL_kVersymHiddenBit) :
+           verneed == (verdef & ~ADL_kVersymHiddenBit);
 }
 
 static ElfW(Addr) adl_resolve_symbol_address(const adl_so_info *soInfo,
                                              const ElfW(Sym) *s) {
     if (ELF_ST_TYPE(s->st_info) == STT_GNU_IFUNC) {
-        //TODO : ifunc handle
-//        return call_ifunc_resolver(s->st_value + soInfo->load_bias);
-        return 0;
+        typedef ElfW(Addr) (*ifunc_resolver_t)(void);
+        ifunc_resolver_t resolver = reinterpret_cast<ifunc_resolver_t>(
+                s->st_value + soInfo->load_bias);
+        return resolver();
     }
 
     return static_cast<ElfW(Addr)>(s->st_value + soInfo->load_bias);
@@ -456,14 +455,16 @@ static int adl_find_library_callback(struct dl_phdr_info *info,
 static adl_so_info *adl_find_library_by_maps(const char *filename) {
     adl_so_info *soInfo = NULL;
     ElfW(Addr) start = adl_read_base_by_maps(filename);
+    if (start == 0) return NULL;
     ElfW(Ehdr) *elfHdr = reinterpret_cast<ElfW(Ehdr) *>(start);
     adl_elf_reader *reader = static_cast<adl_elf_reader *>(
             calloc(1, sizeof(adl_elf_reader)));
     reader->fd_ = -1;
-    reader->name_ = soInfo->filename;
+    reader->name_ = filename;
     reader->header_ = elfHdr;
     if (!reader->verify_elf_header()) {
         ADLOGW("maps(%s) base is not elf header", filename);
+        free(reader);
         return NULL;
     }
     const ElfW(Phdr) *phdr_table = reinterpret_cast<const ElfW(Phdr) *>(elfHdr +
@@ -471,7 +472,10 @@ static adl_so_info *adl_find_library_by_maps(const char *filename) {
     ElfW(Addr) min_vaddr, max_vaddr;
     adl_phdr_table_get_load_size(phdr_table, elfHdr->e_phnum, &min_vaddr,
                                  &max_vaddr);
-    if (min_vaddr == UINTPTR_MAX) return NULL;//min address is invalid
+    if (min_vaddr == UINTPTR_MAX) {
+        free(reader);
+        return NULL;//min address is invalid
+    }
     ElfW(Addr) load_bias = start - min_vaddr;
 
     soInfo = static_cast<adl_so_info *>(calloc(1, sizeof(so_info)));
@@ -576,9 +580,11 @@ static int adl_prelink_image(adl_so_info *soInfo) {
     adl_tls_segment tls_segment;
     if (adl_get_tls_segment(soInfo->phdr, soInfo->phnum, soInfo->load_bias, &tls_segment)) {
         if (!adl_check_tls_alignment(&tls_segment.alignment)) {
-            return false;
+            return -1;
         }
-        soInfo->tls_segment = &tls_segment;
+        soInfo->tls_segment = static_cast<adl_tls_segment *>(
+                calloc(1, sizeof(adl_tls_segment)));
+        *soInfo->tls_segment = tls_segment;
     }
 
     // Extract useful information from dynamic section.
@@ -619,7 +625,7 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 if (!powerof2(soInfo->gnu_maskwords_)) {
                     ADLOGE("invalid maskwords for gnu_hash = 0x%x, in \"%s\" expecting power to two",
                            soInfo->gnu_maskwords_, soInfo->filename);
-                    return false;
+                    return -1;
                 }
                 --soInfo->gnu_maskwords_;
                 soInfo->flags_ |= ADL_FLAG_GNU_HASH;
@@ -637,19 +643,19 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 if (d->d_un.d_val != sizeof(ElfW(Sym))) {
                     ADLOGE("invalid DT_SYMENT: %zd in \"%s\"",
                            static_cast<size_t>(d->d_un.d_val), soInfo->filename);
-                    return false;
+                    return -1;
                 }
                 break;
             case DT_PLTREL:
 #if defined(ADL_USE_RELA)
                 if (d->d_un.d_val != DT_RELA) {
                     ADLOGE("unsupported DT_PLTREL in \"%s\"; expected DT_RELA", soInfo->filename);
-                    return false;
+                    return -1;
                 }
 #else
                 if (d->d_un.d_val != DT_REL) {
                     ADLOGE("unsupported DT_PLTREL in \"%s\"; expected DT_REL", soInfo->filename);
-                    return false;
+                    return -1;
                 }
 #endif
                 break;
@@ -691,16 +697,16 @@ static int adl_prelink_image(adl_so_info *soInfo) {
 
                 case DT_ANDROID_REL:
                     ADLOGE("unsupported DT_ANDROID_REL in \"%s\"", soInfo->filename);
-                    return false;
+                    return -1;
 
                 case DT_ANDROID_RELSZ:
                     ADLOGE("unsupported DT_ANDROID_RELSZ in \"%s\"", soInfo->filename);
-                    return false;
+                    return -1;
 
                 case DT_RELAENT:
                     if (d->d_un.d_val != sizeof(ElfW(Rela))) {
                         ADLOGE("invalid DT_RELAENT: %zd", static_cast<size_t>(d->d_un.d_val));
-                        return false;
+                        return -1;
                     }
                     break;
 
@@ -710,11 +716,11 @@ static int adl_prelink_image(adl_so_info *soInfo) {
 
                 case DT_REL:
                     ADLOGE("unsupported DT_REL in \"%s\"", soInfo->filename);
-                    return false;
+                    return -1;
 
                 case DT_RELSZ:
                     ADLOGE("unsupported DT_RELSZ in \"%s\"", soInfo->filename);
-                    return false;
+                    return -1;
 #else
             case DT_REL:
                 soInfo->rel_ = reinterpret_cast<ElfW(Rel) *>(load_bias + d->d_un.d_ptr);
@@ -725,7 +731,7 @@ static int adl_prelink_image(adl_so_info *soInfo) {
             case DT_RELENT:
                 if (d->d_un.d_val != sizeof(ElfW(Rel))) {
                     ADLOGE("invalid DT_RELENT: %zd", static_cast<size_t>(d->d_un.d_val));
-                    return false;
+                    return -1;
                 }
                 break;
             case DT_ANDROID_REL:
@@ -736,10 +742,10 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 break;
             case DT_ANDROID_RELA:
                 ADLOGE("unsupported DT_ANDROID_RELA in \"%s\"", soInfo->filename);
-                return false;
+                return -1;
             case DT_ANDROID_RELASZ:
                 ADLOGE("unsupported DT_ANDROID_RELASZ in \"%s\"", soInfo->filename);
-                return false;
+                return -1;
                 // "Indicates that all RELATIVE relocations have been concatenated together,
                 // and specifies the RELATIVE relocation count."
                 //
@@ -749,10 +755,10 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 break;
             case DT_RELA:
                 ADLOGE("unsupported DT_RELA in \"%s\"", soInfo->filename);
-                return false;
+                return -1;
             case DT_RELASZ:
                 ADLOGE("unsupported DT_RELASZ in \"%s\"", soInfo->filename);
-                return false;
+                return -1;
 #endif
             case DT_RELR:
                 soInfo->relr_ = reinterpret_cast<ElfW(Relr) *>(load_bias + d->d_un.d_ptr);
@@ -763,13 +769,13 @@ static int adl_prelink_image(adl_so_info *soInfo) {
             case DT_RELRENT:
                 if (d->d_un.d_val != sizeof(ElfW(Relr))) {
                     ADLOGE("invalid DT_RELRENT: %zd", static_cast<size_t>(d->d_un.d_val));
-                    return false;
+                    return -1;
                 }
                 break;
             case DT_TEXTREL:
 #if defined(__LP64__)
                 ADLOGE("\"%s\" has text relocations", soInfo->filename);
-                return false;
+                return -1;
 #else
                 soInfo->has_text_relocations = true;
                 break;
@@ -784,7 +790,7 @@ static int adl_prelink_image(adl_so_info *soInfo) {
                 if (d->d_un.d_val & DF_TEXTREL) {
 #if defined(__LP64__)
                     ADLOGE("\"%s\" has text relocations", soInfo->filename);
-                    return false;
+                    return -1;
 #else
                     soInfo->has_text_relocations = true;
 #endif
@@ -858,6 +864,8 @@ bool adl_read_elf(adl_so_info *soInfo) {
         ADLOGW("adl_so_info base address is not ELF header, try to load from file.");
         if (!reader->read_elf_header(true)) {
             ADLOGE("read elf header failed.");
+            soInfo->elf_reader = NULL;
+            free(reader);
             return false;
         }
     } else {
@@ -868,6 +876,9 @@ bool adl_read_elf(adl_so_info *soInfo) {
         !reader->read_section_headers() ||
         !reader->read_other_section()) {
         ADLOGE("read elf(%s) information failed .", soInfo->filename);
+        reader->recycle();
+        free(reader);
+        soInfo->elf_reader = NULL;
         return false;
     }
     return true;
@@ -1054,7 +1065,7 @@ static const ElfW(Sym) *adlsym_handle_lookup(adl_so_info *soInfo,
     if (adl_prelink_image(soInfo) < 0)
         return NULL;
 
-    const ElfW(Sym) *symbol;
+    const ElfW(Sym) *symbol = NULL;
     if (soInfo->is_gnu_hash())
         symbol = adl_gnu_lookup(soInfo, symbol_name, vi);
     if (symbol == NULL && soInfo->bucket_ != NULL)
@@ -1168,7 +1179,7 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
         vi = &vi_instance;
     }
 
-    adl_symbol adlSymbol;
+    adl_symbol adlSymbol{};
     adlSymbol.name_ = sym_name;
     sym = adlsym_handle_lookup(soInfo, adlSymbol, vi);
     if (sym != NULL) {
@@ -1186,9 +1197,10 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
                     return false;
                 }
 
-                //TODO : get tls block
-//                void* tls_block = get_tls_block_for_this_thread(tls_module, /*should_alloc=*/true);
-//                *symbol = static_cast<char*>(tls_block) + sym->st_value;
+                // TLS symbol resolution requires the module's TLS ID from linker-internal
+                // soinfo, which is not accessible without version-specific struct offsets.
+                ADLOGW("TLS symbol \"%s\" in \"%s\" is not supported by adlsym",
+                       sym_name, soInfo->filename);
                 return false;
             } else {
                 ElfW(Addr) resolved_addr = adl_resolve_symbol_address(soInfo, sym);
@@ -1271,8 +1283,11 @@ int adlclose(void *handle) {
     adl_so_info *soInfo = (adl_so_info *) handle;
     if (NULL != soInfo->filename)
         free((void *) soInfo->filename);
-    if (NULL != soInfo->elf_reader)
+    if (NULL != soInfo->elf_reader) {
         static_cast<elf_reader *>(soInfo->elf_reader)->recycle();
+        free(soInfo->elf_reader);
+    }
+    free(soInfo->tls_segment);
     void *dlopen_handle = soInfo->dlopen_handle;
     free(soInfo);
     if (NULL != dlopen_handle) {
