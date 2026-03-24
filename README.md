@@ -117,10 +117,198 @@ adl_iterate_phdr(callback, user_data);
 adlclose(handle);
 ```
 
+---
+
+# AndHooker
+
+`andhooker` is a companion module that provides **PLT/GOT hook** and **inline hook** capabilities, built on top of AndLinker's symbol resolution.
+
+## Hook Types
+
+### PLT/GOT Hook
+
+PLT hook intercepts function calls **from a specific library** by modifying its GOT (Global Offset Table) entries.
+
+```
+app calls strlen()
+  → PLT stub in libsample.so
+    → GOT entry (originally points to libc strlen)
+      → [HOOKED] GOT entry now points to your proxy function
+        → proxy calls original via saved pointer
+```
+
+**Characteristics:**
+- Only affects calls from the specified library (other libraries still call the original)
+- Safe for high-frequency functions (strlen, memcpy, etc.) — only one module affected
+- Can modify parameters, return values, or block calls
+- No instruction relocation needed — just a pointer swap
+
+### Inline Hook
+
+Inline hook patches the **function entry** directly, affecting **all callers** across the entire process.
+
+```
+Any code calls gettimeofday()
+  → function entry (first 16 bytes replaced with jump)
+    → Hub assembly trampoline
+      → Check TLS recursion state
+        → First call: jump to proxy function
+        → Recursive call: jump to original (via trampoline)
+    → proxy executes, calls orig via trampoline
+    → Hub epilogue: pop recursion state, return to caller
+```
+
+**Characteristics:**
+- Affects ALL callers in the process (global interception)
+- Instruction relocation engine handles PC-relative instructions in trampoline
+- Hub mechanism provides automatic recursion prevention (no user code needed)
+- FORTIFY auto-detection: framework detects `__xxx_chk` wrappers and adjusts target
+
+## How It Works
+
+### PLT Hook Implementation
+
+1. `adlopen(caller_lib)` → parse dynamic section via `adl_prelink_image`
+2. Iterate `.rela.plt` / `.rel.plt` entries to find target symbol
+3. Calculate GOT entry address: `load_bias + relocation.r_offset`
+4. `mprotect` GOT page to writable → write new function pointer → restore protection
+5. Save original pointer for unhook and `orig_func` callback
+
+### Inline Hook Implementation
+
+#### 1. FORTIFY Auto-Detection
+
+When user hooks `strlen`, the framework:
+1. Reverse-lookups symbol name via `adladdr`
+2. Checks if `__strlen_chk` exists in the same library (pattern: `__<name>_chk` or `__<name>_2`)
+3. If found, hooks the FORTIFY wrapper instead; `orig_func` points to the raw function
+
+This prevents FORTIFY abort: `__strlen_chk` validates strlen's return value, so hooking raw strlen with a modified return triggers a security check. Hooking `__strlen_chk` directly bypasses this.
+
+#### 2. BTI (Branch Target Identification) Handling
+
+ARM64 security feature: CPU verifies branch targets have BTI instructions. If a function starts with `HINT #34` (BTI), the hook patches **after** the BTI instruction, and the trampoline includes BTI at its entry.
+
+#### 3. Instruction Relocation
+
+The first 16 bytes of the target function are overwritten with a jump. The original instructions are moved to a trampoline with PC-relative fixups:
+
+| ARM64 Instruction | Relocation Method |
+|-------------------|-------------------|
+| B / BL | → Absolute jump (LDR X17 + BR X17) |
+| B.cond | → Invert condition skip + absolute jump |
+| CBZ / CBNZ | → Same pattern |
+| TBZ / TBNZ | → Same pattern |
+| ADRP | → LDR Xd from literal pool |
+| ADR | → LDR Xd from literal pool |
+| LDR literal (all variants) | → Load address + indirect load |
+| Other instructions | Direct copy (no relocation needed) |
+
+ARM32 (ARM + Thumb) and x86/x86_64 relocators are also included.
+
+#### 4. Hub Mechanism (Automatic Recursion Prevention)
+
+Inspired by [ShadowHook](https://github.com/bytedance/android-inline-hook), the hub prevents infinite recursion when a proxy function indirectly re-enters the hooked function.
+
+**Architecture (ARM64):**
+
+The hub is an assembly template (`adl_hub_arm64.S`) compiled by the assembler for correct instruction encoding, then copied to `mmap`'d executable memory at runtime:
+
+1. **Hub entry**: Saves all parameter registers (x0-x8, q0-q7, LR), calls `adl_hub_push()` in C
+2. **Push logic**: Checks per-thread TLS frame stack — if `orig_addr` already present, it's recursive → return trampoline address; otherwise push frame → return proxy address
+3. **Hub entry (cont)**: Restores all registers, sets LR to hub return address, jumps to decision result
+4. **Proxy executes**: User code runs normally, any re-entrant calls go through hub again (detected as recursive)
+5. **Hub return**: Proxy returns here, saves return values, calls `adl_hub_pop()`, restores return values, returns to original caller
+
+**TLS Stack:**
+- Pre-allocated pool of 128 thread stacks (lock-free atomic allocation)
+- Each thread stack holds up to 16 recursion frames
+- `pthread_key_t` for automatic cleanup on thread exit
+
+#### 5. Thread-Safe Ordered Writes
+
+Hook installation uses ordered writes with memory barriers to prevent crashes from concurrent execution:
+
+1. Write target address (bytes 8-15) first
+2. Memory barrier (`dmb ish` on ARM, `mfence` on x86)
+3. Write jump instruction (bytes 0-7) — atomically activates the hook
+
+Result: concurrent threads either execute complete old code or complete new hook, never partial/corrupted instructions.
+
+## AndHooker API
+
+```cpp
+#include <adl_hook.h>
+
+// --- PLT Hook ---
+// Hook close() calls from libsample.so only
+static int (*orig_close)(int) = NULL;
+int my_close(int fd) {
+    log("closing fd=%d", fd);
+    return orig_close(fd);
+}
+adl_plt_hook("libsample.so", "close", my_close, &orig_close);
+adl_plt_unhook("libsample.so", "close");
+
+// --- Inline Hook ---
+// Hook gettimeofday() globally (all callers affected)
+static int (*orig_gettimeofday)(struct timeval*, struct timezone*) = NULL;
+int my_gettimeofday(struct timeval *tv, struct timezone *tz) {
+    int ret = orig_gettimeofday(tv, tz);  // call original
+    if (ret == 0) tv->tv_sec += 86400;    // add 1 day
+    return ret;
+}
+void *target = adlsym(adlopen("libc.so", 0), "gettimeofday");
+adl_inline_hook(target, my_gettimeofday, (void**)&orig_gettimeofday);
+adl_inline_unhook(target);
+```
+
+## Limitations and Best Practices
+
+### Inline Hook: Return Value Modification
+
+**Safe to modify return values for:**
+- Low-frequency functions: `gettimeofday`, `localtime`, `atoi`, `access`, etc.
+- Functions not called by system infrastructure (JIT, GC, malloc)
+
+**Unsafe to modify return values for:**
+- `strlen`, `memcpy`, `memset`, `malloc`, `free` — these are called by every thread including JIT/GC; modified return values corrupt heap
+- Any IFUNC function with FORTIFY wrapper — `__strlen_chk` validates strlen's return
+
+**For high-frequency global functions:**
+- Use **PLT hook** (only affects one module) to safely modify return values
+- Use **inline hook in observe-only mode** (transparent pass-through) for global interception
+- Or hook the `__xxx_chk` FORTIFY wrapper directly (bypasses FORTIFY validation)
+
+### FORTIFY Functions
+
+Android's `_FORTIFY_SOURCE` replaces many libc functions with checked versions at compile time:
+
+| Function | FORTIFY Wrapper | PLT Hook Target |
+|----------|----------------|-----------------|
+| `strlen` | `__strlen_chk` | `__strlen_chk` |
+| `strcpy` | `__strcpy_chk` | `__strcpy_chk` |
+| `memcpy` | `__memcpy_chk` | `__memcpy_chk` |
+| `sprintf` | `__sprintf_chk` | `__sprintf_chk` |
+| `snprintf` | `__vsnprintf_chk` | `__vsnprintf_chk` |
+| `open` | `__open_2` | `__open_2` |
+
+`adl_inline_hook` auto-detects FORTIFY wrappers at runtime. When you pass `strlen`'s address, the framework automatically hooks `__strlen_chk` instead, and `orig_func` returns the raw `strlen` pointer (matching the original signature).
+
+### Short Functions
+
+Functions shorter than 16 bytes (ARM64 hook size) may overlap with adjacent functions. The framework attempts the hook but logs a warning. Observe-only hooks are generally safe for short functions.
+
 ## Build
 
 Requires Android NDK and CMake 3.10.2+.
 
 ```bash
+# Build all modules
+./gradlew assembleRelease
+
+# Build individually
 ./gradlew :andlinker:assembleRelease
+./gradlew :andhooker:assembleRelease
+./gradlew :sample:assembleDebug
 ```
