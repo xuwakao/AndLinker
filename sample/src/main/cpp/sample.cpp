@@ -271,15 +271,22 @@ static void adl_test() {
                 result_fail("adlsym(JNI_GetCreatedJavaVMs)");
             }
 
-            // _ZN3art9ArtMethod12PrettyMethodEb: internal symbol
-            // art::ArtMethod::PrettyMethod(bool) — private API
-            void *sym2 = adlsym(art_handle, "_ZN3art9ArtMethod12PrettyMethodEb");
+            // fuzzy match: ArtMethod::PrettyMethod (mangled name varies across versions)
+            auto match_cb = [](const char *name, void *addr, size_t size,
+                               int type, void *arg) -> int {
+                std::string *r = static_cast<std::string *>(arg);
+                char buf[256];
+                snprintf(buf, sizeof(buf), "  match: %s -> %p", name, addr);
+                *r += buf;
+                *r += "\n";
+                return 0; // continue to show all matches
+            };
+            void *sym2 = adlsym_match(art_handle, "ArtMethod::PrettyMethod", match_cb, &g_result);
             if (sym2 != NULL) {
-                result_pass("adlsym(ArtMethod::PrettyMethod) -> %p", sym2);
-                verify_readable(sym2, "ArtMethod::PrettyMethod");
+                result_pass("adlsym_match(PrettyMethod) -> %p", sym2);
+                verify_readable(sym2, "PrettyMethod");
             } else {
-                // symbol may be stripped or mangled differently across versions
-                result_info("ArtMethod::PrettyMethod not found (may be stripped)");
+                result_info("PrettyMethod not found (may be stripped)");
             }
 
             adlclose(art_handle);

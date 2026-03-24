@@ -1,6 +1,7 @@
 #include <jni.h>
 #include <cstdlib>
 #include <cstdarg>
+#include <cxxabi.h>
 #include <sys/param.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -1475,6 +1476,137 @@ int adl_enum_symbols(void *handle, adl_symbol_callback callback, void *arg) {
     }
 
     return count;
+}
+
+// Internal helper: iterate symbols matching substring, call visitor for each
+// Uses a simple array to deduplicate by address
+static void *adl_match_iterate(adl_so_info *soInfo, const char *pattern,
+                               adl_symbol_callback callback, void *arg) {
+    ElfW(Addr) load_bias = soInfo->load_bias;
+    void *first_match = NULL;
+
+    // dedup by address: track seen addresses to avoid reporting same symbol twice
+    static const size_t kMaxSeen = 256;
+    void *seen[kMaxSeen];
+    size_t seen_count = 0;
+
+    auto is_seen = [&](void *addr) -> bool {
+        for (size_t i = 0; i < seen_count; i++) {
+            if (seen[i] == addr) return true;
+        }
+        return false;
+    };
+    auto mark_seen = [&](void *addr) {
+        if (seen_count < kMaxSeen) seen[seen_count++] = addr;
+    };
+
+    // helper: check if match_pos has a word boundary on the left
+    auto has_word_boundary = [](const char *str, const char *pos) -> bool {
+        return pos == str || !isalpha(*(pos - 1));
+    };
+
+    // macro to check a symbol against pattern (demangle first, then raw fallback)
+    #define ADL_CHECK_MATCH(sym_, name_, strtab_used_) do { \
+        if ((sym_)->st_shndx == SHN_UNDEF) break; \
+        if ((sym_)->st_shndx >= SHN_LORESERVE && (sym_)->st_shndx <= SHN_HIRESERVE) break; \
+        if ((name_)[0] == '\0') break; \
+        bool matched_ = false; \
+        const char *display_name_ = (name_); \
+        /* 1. try demangle match */ \
+        char *demangled_ = abi::__cxa_demangle((name_), NULL, NULL, NULL); \
+        if (demangled_ != NULL) { \
+            const char *pos_ = strstr(demangled_, pattern); \
+            if (pos_ != NULL && has_word_boundary(demangled_, pos_)) { \
+                matched_ = true; \
+                display_name_ = demangled_; \
+            } \
+        } \
+        /* 2. fallback: raw name match */ \
+        if (!matched_) { \
+            const char *pos_ = strstr((name_), pattern); \
+            if (pos_ != NULL && has_word_boundary((name_), pos_)) { \
+                matched_ = true; \
+            } \
+        } \
+        if (!matched_) { free(demangled_); break; } \
+        void *addr_ = reinterpret_cast<void *>((sym_)->st_value + load_bias); \
+        if (is_seen(addr_)) { free(demangled_); break; } \
+        mark_seen(addr_); \
+        int type_ = ELF_ST_TYPE((sym_)->st_info); \
+        if (first_match == NULL) first_match = addr_; \
+        if (callback != NULL) { \
+            if (callback(display_name_, addr_, (sym_)->st_size, type_, arg) != 0) { \
+                free(demangled_); return addr_; \
+            } \
+        } else { \
+            free(demangled_); return addr_; \
+        } \
+        free(demangled_); \
+    } while(0)
+
+    // .dynsym via hash chain
+    if (soInfo->nchain_ > 0 && soInfo->symtab_ != NULL && soInfo->strtab_ != NULL) {
+        for (size_t i = 0; i < soInfo->nchain_; i++) {
+            const ElfW(Sym) *sym = &soInfo->symtab_[i];
+            const char *name = soInfo->strtab_ + sym->st_name;
+            ADL_CHECK_MATCH(sym, name, true);
+        }
+    } else if (soInfo->gnu_nbucket_ > 0 && soInfo->symtab_ != NULL && soInfo->strtab_ != NULL) {
+        for (size_t i = 0; i < soInfo->gnu_nbucket_; i++) {
+            uint32_t n = soInfo->gnu_bucket_[i];
+            if (n == 0) continue;
+            do {
+                const ElfW(Sym) *sym = &soInfo->symtab_[n];
+                const char *name = soInfo->strtab_ + sym->st_name;
+                ADL_CHECK_MATCH(sym, name, true);
+            } while ((soInfo->gnu_chain_[n++] & 1) == 0);
+        }
+    }
+
+    // .symtab
+    if (adl_read_elf(soInfo)) {
+        adl_elf_reader *reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
+        if (reader->symtab_ != NULL && reader->strtab_ != NULL) {
+            for (size_t i = 0; i < reader->symtab_num_; i++) {
+                const ElfW(Sym) *sym = &reader->symtab_[i];
+                const char *name = &reader->strtab_[sym->st_name];
+                ADL_CHECK_MATCH(sym, name, false);
+            }
+        }
+    }
+
+    #undef ADL_CHECK_MATCH
+
+    // callback iterated all matches but didn't select one — return first match
+    return first_match;
+}
+
+void *adlsym_match(void *handle, const char *pattern,
+                   adl_symbol_callback callback, void *arg) {
+    if (handle == NULL || pattern == NULL) {
+        adl_set_error("adlsym_match: handle or pattern is NULL");
+        return NULL;
+    }
+
+    adl_lock_guard lock;
+
+    // 1. try exact match first
+    void *exact = adlsym(handle, pattern);
+    if (exact != NULL) return exact;
+
+    // 2. substring match
+    adl_so_info *soInfo = (adl_so_info *) handle;
+    if (adl_prelink_image(soInfo) < 0) {
+        adl_set_error("adlsym_match: prelink failed for \"%s\"", soInfo->filename);
+        return NULL;
+    }
+
+    void *result = adl_match_iterate(soInfo, pattern, callback, arg);
+    if (result == NULL) {
+        adl_set_error("adlsym_match: no symbol matching \"%s\" in \"%s\"",
+                      pattern, soInfo->filename);
+    }
+    return result;
 }
 
 __END_DECLS

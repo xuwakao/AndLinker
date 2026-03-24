@@ -39,6 +39,12 @@ typedef int (*adl_symbol_callback)(const char *__name, void *__addr,
                                     size_t __size, int __type, void *__arg);
 int adl_enum_symbols(void *__handle, adl_symbol_callback __callback, void *__arg);
 
+// fuzzy symbol lookup: exact match first, then substring match
+// callback is called for each substring match; return non-zero to select it
+// if callback is NULL, returns the first substring match
+void *adlsym_match(void *__handle, const char *__pattern,
+                   adl_symbol_callback __callback, void *__arg);
+
 __END_DECLS
 
 #endif //ANDLINKER_ADL_H
