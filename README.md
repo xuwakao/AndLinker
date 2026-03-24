@@ -1,3 +1,5 @@
+*Read this in other languages: [English](README.md), [中文](README_CN.md)*
+
 # AndLinker
 
 Android linker bypass library — access private/internal symbols in system shared libraries (`.so`) by bypassing linker namespace restrictions.
