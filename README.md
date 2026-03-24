@@ -298,9 +298,16 @@ Android's `_FORTIFY_SOURCE` replaces many libc functions with checked versions a
 
 ### Short Functions
 
-Functions shorter than 16 bytes (ARM64 hook size) cannot be safely inline hooked — the patch would overwrite adjacent functions. The framework detects this at runtime via `st_size` from the symbol table and **rejects the hook with an error** (`adl_inline_hook` returns -1). Examples: `atol` (12 bytes), `strptime` (8 bytes), `getopt_long_only` (8 bytes).
+ARM64 inline hook overwrites 16 bytes at the function entry. Functions shorter than 16 bytes (e.g., `atol` 12 bytes, `strptime` 8 bytes, `getopt_long_only` 8 bytes) risk overwriting adjacent functions.
 
-For short functions, use **PLT hook** instead (no size restriction since it only modifies a GOT pointer).
+**In practice**, ARM64 compilers align function entries to 16-byte boundaries, so short functions are followed by padding bytes (`udf #0` or `nop`). This makes the overflow land on padding rather than real code. Testing confirms `atol` (12 bytes + 4 bytes padding) can be hooked successfully.
+
+**However**, the framework conservatively **rejects** inline hooks on short functions (`adl_inline_hook` returns -1) because:
+- Custom `.so` files or non-standard linker scripts may not have 16-byte alignment
+- Different compilers or optimization levels may eliminate padding
+- Safety is preferred over relying on alignment assumptions
+
+For short functions, use **PLT hook** instead (no size restriction — only modifies a GOT pointer).
 
 ## Build
 
