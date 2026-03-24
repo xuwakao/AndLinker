@@ -1,7 +1,9 @@
 #include <jni.h>
 #include <cstdlib>
+#include <cstdarg>
 #include <sys/param.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include "adl.h"
 #include "adl_util.h"
@@ -11,6 +13,33 @@
 #include "adl_elf_reader.h"
 
 __BEGIN_DECLS
+
+// --- thread-local error reporting ---
+static __thread char adl_error_buf[256];
+static __thread bool adl_error_flag = false;
+
+static void adl_set_error(const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(adl_error_buf, sizeof(adl_error_buf), fmt, args);
+    va_end(args);
+    adl_error_flag = true;
+    ADLOGE("%s", adl_error_buf);
+}
+
+const char *adlerror(void) {
+    if (!adl_error_flag) return NULL;
+    adl_error_flag = false;
+    return adl_error_buf;
+}
+
+// --- API mutex (recursive to support internal re-entry) ---
+static pthread_mutex_t g_adl_api_mutex = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+
+struct adl_lock_guard {
+    adl_lock_guard() { pthread_mutex_lock(&g_adl_api_mutex); }
+    ~adl_lock_guard() { pthread_mutex_unlock(&g_adl_api_mutex); }
+};
 
 static constexpr ElfW(Versym) ADL_kVersymHiddenBit = 0x8000;
 
@@ -1260,8 +1289,10 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
 }
 
 void *adlsym(void *handle, const char *symbol) {
+    adl_lock_guard lock;
     void *result;
     if (!adl_do_dlsym(handle, symbol, NULL, &result)) {
+        adl_set_error("adlsym: symbol \"%s\" not found", symbol);
         return NULL;
     }
     return result;
@@ -1269,8 +1300,11 @@ void *adlsym(void *handle, const char *symbol) {
 
 void *adlvsym(void *handle, const char *symbol,
               const char *version) {
+    adl_lock_guard lock;
     void *result;
     if (!adl_do_dlsym(handle, symbol, version, &result)) {
+        adl_set_error("adlvsym: symbol \"%s\" version \"%s\" not found",
+                      symbol, version ? version : "(null)");
         return NULL;
     }
     return result;
@@ -1279,6 +1313,7 @@ void *adlvsym(void *handle, const char *symbol,
 int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *),
                      void *__data) {
     if (__callback == NULL) return 0;
+    adl_lock_guard lock;
 
     uintptr_t it_args[2] = {reinterpret_cast<uintptr_t>(__callback),
                             reinterpret_cast<uintptr_t>(__data)};
@@ -1286,9 +1321,10 @@ int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *),
 }
 
 void *adlopen(const char *filename, int flag) {
+    adl_lock_guard lock;
     if (filename == NULL ||
         (filename[0] == '/' && !adl_file_exists(filename))) {
-        ADLOGW("adlopen(%s) file not exist", filename);
+        adl_set_error("adlopen: file \"%s\" not found", filename ? filename : "(null)");
         return NULL;
     }
     adl_so_info *soInfo = adl_find_library(filename);
@@ -1302,12 +1338,12 @@ void *adlopen(const char *filename, int flag) {
 
     void *dlopen_handle = adl_load(filename);
     if (dlopen_handle == NULL) {
-        ADLOGW("adlopen Elf(%s) not loaded", filename);
+        adl_set_error("adlopen: failed to load \"%s\"", filename);
         return NULL;
     }
     soInfo = adl_find_library(filename);
     if (soInfo == NULL) {
-        ADLOGW("adlopen Elf(%s) not loaded again", filename);
+        adl_set_error("adlopen: loaded \"%s\" but failed to find in phdr", filename);
         dlclose(dlopen_handle);
         return NULL;
     }
@@ -1320,7 +1356,11 @@ void *adlopen(const char *filename, int flag) {
 }
 
 int adlclose(void *handle) {
-    if (NULL == handle) return -1;
+    adl_lock_guard lock;
+    if (NULL == handle) {
+        adl_set_error("adlclose: handle is NULL");
+        return -1;
+    }
 
     adl_so_info *soInfo = (adl_so_info *) handle;
     if (NULL != soInfo->filename)
@@ -1339,21 +1379,19 @@ int adlclose(void *handle) {
 }
 
 int adladdr(const void *addr, Dl_info *info) {
-    // Determine if this address can be found in any library currently mapped.
+    adl_lock_guard lock;
     adl_so_info *si = adl_find_containing_library(addr);
     if (si == NULL) {
-        ADLOGW("adladdr find(%p) containing lib failed.", addr);
+        adl_set_error("adladdr: no library contains address %p", addr);
         return 0;
     }
 
     memset(info, 0, sizeof(Dl_info));
 
     info->dli_fname = si->filename;
-    // Address at which the shared object is loaded.
     info->dli_fbase = reinterpret_cast<void *>(si->base);
 
     uintptr_t sym_str;
-    // Determine if any symbol in the library contains the specified address.
     const ElfW(Sym) *sym = find_symbol_by_address(si, addr, &sym_str);
     if (sym != NULL) {
         info->dli_sname = reinterpret_cast<const char *>(sym_str);
@@ -1362,6 +1400,81 @@ int adladdr(const void *addr, Dl_info *info) {
     }
 
     return 1;
+}
+
+int adl_enum_symbols(void *handle, adl_symbol_callback callback, void *arg) {
+    if (handle == NULL || callback == NULL) {
+        adl_set_error("adl_enum_symbols: handle or callback is NULL");
+        return -1;
+    }
+
+    adl_lock_guard lock;
+    adl_so_info *soInfo = (adl_so_info *) handle;
+
+    if (adl_prelink_image(soInfo) < 0) {
+        adl_set_error("adl_enum_symbols: prelink failed for \"%s\"", soInfo->filename);
+        return -1;
+    }
+
+    int count = 0;
+    ElfW(Addr) load_bias = soInfo->load_bias;
+
+    // enumerate .dynsym via hash chain (covers all dynamic symbols)
+    if (soInfo->nchain_ > 0 && soInfo->symtab_ != NULL && soInfo->strtab_ != NULL) {
+        for (size_t i = 0; i < soInfo->nchain_; i++) {
+            const ElfW(Sym) *sym = &soInfo->symtab_[i];
+            if (sym->st_shndx == SHN_UNDEF) continue;
+            if (sym->st_shndx >= SHN_LORESERVE && sym->st_shndx <= SHN_HIRESERVE) continue;
+            const char *name = soInfo->strtab_ + sym->st_name;
+            if (name[0] == '\0') continue;
+            void *addr = reinterpret_cast<void *>(sym->st_value + load_bias);
+            int type = ELF_ST_TYPE(sym->st_info);
+            count++;
+            if (callback(name, addr, sym->st_size, type, arg) != 0)
+                return count;
+        }
+    } else if (soInfo->gnu_nbucket_ > 0 && soInfo->symtab_ != NULL && soInfo->strtab_ != NULL) {
+        // GNU hash: enumerate by walking all buckets and chains
+        for (size_t i = 0; i < soInfo->gnu_nbucket_; i++) {
+            uint32_t n = soInfo->gnu_bucket_[i];
+            if (n == 0) continue;
+            do {
+                const ElfW(Sym) *sym = &soInfo->symtab_[n];
+                if (sym->st_shndx != SHN_UNDEF &&
+                    !(sym->st_shndx >= SHN_LORESERVE && sym->st_shndx <= SHN_HIRESERVE)) {
+                    const char *name = soInfo->strtab_ + sym->st_name;
+                    if (name[0] != '\0') {
+                        void *addr = reinterpret_cast<void *>(sym->st_value + load_bias);
+                        int type = ELF_ST_TYPE(sym->st_info);
+                        count++;
+                        if (callback(name, addr, sym->st_size, type, arg) != 0)
+                            return count;
+                    }
+                }
+            } while ((soInfo->gnu_chain_[n++] & 1) == 0);
+        }
+    }
+
+    // enumerate .symtab (from ELF file, includes static/local symbols)
+    if (adl_read_elf(soInfo)) {
+        adl_elf_reader *reader = static_cast<adl_elf_reader *>(soInfo->elf_reader);
+        if (reader->symtab_ != NULL && reader->strtab_ != NULL) {
+            for (size_t i = 0; i < reader->symtab_num_; i++) {
+                const ElfW(Sym) *sym = &reader->symtab_[i];
+                if (sym->st_shndx == SHN_UNDEF) continue;
+                if (sym->st_shndx >= SHN_LORESERVE && sym->st_shndx <= SHN_HIRESERVE) continue;
+                const char *name = &reader->strtab_[sym->st_name];
+                if (name[0] == '\0') continue;
+                void *addr = reinterpret_cast<void *>(sym->st_value + load_bias);
+                int type = ELF_ST_TYPE(sym->st_info);
+                count++;
+                if (callback(name, addr, sym->st_size, type, arg) != 0)
+                    return count;
+            }
+        }
+    }
+
+    return count;
 }
 
 __END_DECLS

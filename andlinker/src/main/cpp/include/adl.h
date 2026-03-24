@@ -23,13 +23,21 @@ void *adlsym(void *__handle, const char *__symbol);
 
 void *adlvsym(void *__handle,
               const char *__symbol,
-              const char *__version) __INTRODUCED_IN(24);
+              const char *__version);
 
 int adladdr(const void *__addr, Dl_info *__info);
+
+const char *adlerror(void);
 
 //link.h
 //https://android.googlesource.com/platform/bionic/+/master/docs/status.md
 int adl_iterate_phdr(int (*__callback)(dl_phdr_info *, size_t, void *), void *__data);
+
+// symbol enumeration
+// callback returns 0 to continue, non-zero to stop
+typedef int (*adl_symbol_callback)(const char *__name, void *__addr,
+                                    size_t __size, int __type, void *__arg);
+int adl_enum_symbols(void *__handle, adl_symbol_callback __callback, void *__arg);
 
 __END_DECLS
 

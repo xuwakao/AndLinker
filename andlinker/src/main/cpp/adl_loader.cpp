@@ -106,23 +106,29 @@ void *adl_load(const char *filename) {
     //< android 7.0
     if (level < __ANDROID_API_N__) {
         return dlopen(filename, RTLD_NOW);
-    } else {
-        adl_loader_init();
-        if (level >= __ANDROID_API_P__ && adl_loader_dlopen) {
-            return adl_loader_dlopen(filename, RTLD_NOW, FAKE_CALLER_ADDR);
-        } else if (level >= __ANDROID_API_O__ && adl_android_dlopen_O_ext) {
-            return adl_android_dlopen_O_ext(filename, RTLD_NOW, NULL, FAKE_CALLER_ADDR);
-        } else if (level >= __ANDROID_API_N__ && adl_do_dlopen_N_ext) {
-            adl_loader_lock();
-            void *handle = adl_do_dlopen_N_ext(filename, RTLD_NOW, NULL,
-                                               const_cast<void *>(FAKE_CALLER_ADDR));
-            adl_loader_unlock();
-            return handle;
-        } else {
-            ADLOGW("dlopen function is NULL");
-        }
     }
-    return NULL;
+
+    adl_loader_init();
+    void *handle = NULL;
+
+    if (level >= __ANDROID_API_P__ && adl_loader_dlopen) {
+        handle = adl_loader_dlopen(filename, RTLD_NOW, FAKE_CALLER_ADDR);
+    } else if (level >= __ANDROID_API_O__ && adl_android_dlopen_O_ext) {
+        handle = adl_android_dlopen_O_ext(filename, RTLD_NOW, NULL, FAKE_CALLER_ADDR);
+    } else if (level >= __ANDROID_API_N__ && adl_do_dlopen_N_ext) {
+        adl_loader_lock();
+        handle = adl_do_dlopen_N_ext(filename, RTLD_NOW, NULL,
+                                     const_cast<void *>(FAKE_CALLER_ADDR));
+        adl_loader_unlock();
+    }
+
+    // Fallback: try standard dlopen if bypass failed
+    if (handle == NULL) {
+        ADLOGW("bypass dlopen failed for \"%s\", trying standard dlopen", filename);
+        handle = dlopen(filename, RTLD_NOW);
+    }
+
+    return handle;
 }
 
 __END_DECLS
