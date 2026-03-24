@@ -9,8 +9,14 @@
 #include "adl_relocate.h"
 
 #define HTAG "adl_relocate"
+//#define ADL_RELOCATE_VERBOSE
+#ifdef ADL_RELOCATE_VERBOSE
 #define RLOGI(...) __android_log_print(ANDROID_LOG_INFO, HTAG, __VA_ARGS__)
 #define RLOGW(...) __android_log_print(ANDROID_LOG_WARN, HTAG, __VA_ARGS__)
+#else
+#define RLOGI(...)
+#define RLOGW(...)
+#endif
 #define RLOGE(...) __android_log_print(ANDROID_LOG_ERROR, HTAG, __VA_ARGS__)
 
 #define ARM64_HOOK_SIZE 16

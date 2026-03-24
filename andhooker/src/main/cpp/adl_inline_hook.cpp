@@ -17,9 +17,15 @@
 #include "adl.h"
 
 #define HOOKER_TAG "adl_hooker"
+//#define ADL_HOOKER_VERBOSE
+#ifdef ADL_HOOKER_VERBOSE
 #define HLOGI(...) __android_log_print(ANDROID_LOG_INFO, HOOKER_TAG, __VA_ARGS__)
-#define HLOGE(...) __android_log_print(ANDROID_LOG_ERROR, HOOKER_TAG, __VA_ARGS__)
 #define HLOGW(...) __android_log_print(ANDROID_LOG_WARN, HOOKER_TAG, __VA_ARGS__)
+#else
+#define HLOGI(...)
+#define HLOGW(...)
+#endif
+#define HLOGE(...) __android_log_print(ANDROID_LOG_ERROR, HOOKER_TAG, __VA_ARGS__)
 
 // Architecture hook entry sizes
 #if defined(__aarch64__)
@@ -342,36 +348,63 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
     }
 #endif
 
-    // Create hub for automatic recursion prevention
+    // Check if this target is already hooked (multi-hook support)
+    inline_hook_record *existing = NULL;
+    for (inline_hook_record *r = g_inline_hooks; r != NULL; r = r->next) {
+        if (r->target == target_func) {
+            existing = r;
+            break;
+        }
+    }
+
+    if (existing != NULL) {
+        // Multi-hook: add proxy to existing hub chain
+        munmap(trampoline, PAGE_SIZE);  // don't need a new trampoline
+
+        void *proxy_orig = adl_hub_add_proxy(existing->hub_data, new_func);
+        if (orig_func != NULL) {
+            if (fortify_target != NULL) {
+                *orig_func = raw_target;
+            } else {
+                *orig_func = proxy_orig;  // points to previous proxy or trampoline
+            }
+        }
+        HLOGI("Multi-hook: added proxy %p to existing hook on %p, orig=%p",
+              new_func, target_func, proxy_orig);
+        return 0;
+    }
+
+    // First hook on this target — create hub
     adl_hub_data_t *hub_data = new adl_hub_data_t();
     hub_data->orig_addr = target_func;
-    hub_data->proxy_func = new_func;
+    hub_data->proxies = NULL;
     hub_data->trampoline = trampoline_for_caller;
+    hub_data->flags = 0;
+    hub_data->hub_slot = NULL;
+
+    // Add first proxy
+    adl_hub_add_proxy(hub_data, new_func);
 
     void *hub_entry = adl_hub_create(hub_data);
     void *jump_target;
 
     if (hub_entry != NULL) {
-        // Hub available: target jumps to hub, hub manages proxy/trampoline dispatch
         jump_target = hub_entry;
         HLOGI("Inline hook with hub: %p -> hub@%p -> proxy@%p (trampoline@%p)",
               target_func, hub_entry, new_func, trampoline);
     } else {
-        // Hub not available (non-ARM64): fall back to direct jump to proxy
         jump_target = new_func;
         HLOGW("Inline hook without hub (no recursion guard): %p -> %p", target_func, new_func);
     }
 
-    // Write hook with ordered writes (thread-safe)
+    // Write hook
     ordered_write_hook(target_func, jump_target, hook_size, is_thumb);
 
-    // Return orig function pointer to caller
+    // Return orig pointer
     if (orig_func != NULL) {
         if (fortify_target != NULL) {
-            // FORTIFY mode: orig points to raw function (matching user's expected signature)
-            // e.g., user hooks strlen → we hook __strlen_chk → orig returns raw strlen
             *orig_func = raw_target;
-            HLOGI("FORTIFY: orig_func set to raw function %p (not FORTIFY trampoline)", raw_target);
+            HLOGI("FORTIFY: orig_func set to raw function %p", raw_target);
         } else {
             *orig_func = trampoline_for_caller;
         }
@@ -424,4 +457,33 @@ int adl_inline_unhook(void *target_func) {
 
     HLOGE("adl_inline_unhook: no hook record for %p", target_func);
     return -1;
+}
+
+// ============================================================================
+// Reentrant control
+// ============================================================================
+
+static inline_hook_record *find_record(void *target_func) {
+    for (inline_hook_record *r = g_inline_hooks; r != NULL; r = r->next) {
+        if (r->user_target == target_func || r->target == target_func) {
+            return r;
+        }
+    }
+    return NULL;
+}
+
+int adl_inline_hook_allow_reentrant(void *target_func) {
+    inline_hook_record *r = find_record(target_func);
+    if (r == NULL || r->hub_data == NULL) return -1;
+    r->hub_data->flags |= ADL_HUB_FLAG_ALLOW_REENTRANT;
+    HLOGI("allow reentrant: %p", target_func);
+    return 0;
+}
+
+int adl_inline_hook_disallow_reentrant(void *target_func) {
+    inline_hook_record *r = find_record(target_func);
+    if (r == NULL || r->hub_data == NULL) return -1;
+    r->hub_data->flags &= ~ADL_HUB_FLAG_ALLOW_REENTRANT;
+    HLOGI("disallow reentrant: %p", target_func);
+    return 0;
 }

@@ -211,7 +211,7 @@ ARM32 (ARM + Thumb) and x86/x86_64 relocators are also included.
 
 #### 4. Hub Mechanism (Automatic Recursion Prevention)
 
-Inspired by [ShadowHook](https://github.com/bytedance/android-inline-hook), the hub prevents infinite recursion when a proxy function indirectly re-enters the hooked function.
+The hub prevents infinite recursion when a proxy function indirectly re-enters the hooked function.
 
 **Architecture (ARM64):**
 
@@ -228,7 +228,37 @@ The hub is an assembly template (`adl_hub_arm64.S`) compiled by the assembler fo
 - Each thread stack holds up to 16 recursion frames
 - `pthread_key_t` for automatic cleanup on thread exit
 
+**Shared Hub Pages:**
+- Multiple hub slots share a single 4KB mmap page (256 bytes per slot, 16 slots per page)
+- Reduces memory from 4KB per hook to ~256 bytes per hook
+
 > **Note:** Hub is currently implemented for ARM64 only. On ARM32/x86/x86_64, inline hooks fall back to direct proxy jumps without automatic recursion prevention.
+
+#### 6. Multi-Hook Support
+
+The same function can be hooked multiple times by different modules. Each hook adds a proxy to the chain:
+
+```
+function entry → hub → proxy_C (newest)
+                         ↓ orig_C calls
+                       proxy_B
+                         ↓ orig_B calls
+                       proxy_A (oldest)
+                         ↓ orig_A calls
+                       trampoline → original function
+```
+
+Each `adl_inline_hook` call on an already-hooked function adds a new proxy to the head of the chain. The `orig_func` returned to each caller points to the next proxy (or trampoline for the first hook).
+
+#### 7. Reentrant Control
+
+By default, the hub blocks recursive calls to prevent infinite loops. For scenarios where legitimate recursion is needed (e.g., thread pools, recursive algorithms), reentrant mode can be enabled per hook point:
+
+```cpp
+adl_inline_hook(target, my_proxy, &orig);
+adl_inline_hook_allow_reentrant(target);   // recursive calls now go through proxy
+adl_inline_hook_disallow_reentrant(target); // back to default (block recursion)
+```
 
 #### 5. Thread-Safe Ordered Writes
 

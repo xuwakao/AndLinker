@@ -17,7 +17,7 @@
 #include <ctype.h>
 #include <cstdlib>
 
-//#define NO_LOG
+#define NO_LOG
 #define TAG "adl"
 #ifndef NO_LOG
 #define ADLOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)

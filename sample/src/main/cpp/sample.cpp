@@ -1320,6 +1320,128 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
+    // 32. Multi-hook: two hooks on same function (atoi)
+    g_result += "\n--- Multi-hook: atoi (2 proxies) ---\n";
+    {
+        typedef int (*atoi_fn)(const char *);
+        static atoi_fn orig_atoi_a = NULL;
+        static atoi_fn orig_atoi_b = NULL;
+
+        struct hook_a {
+            static int proxy(const char *s) {
+                return orig_atoi_a(s) + 100;  // +100
+            }
+        };
+        struct hook_b {
+            static int proxy(const char *s) {
+                return orig_atoi_b(s) + 1000;  // +1000 (calls hook_a via orig)
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "atoi") : NULL;
+        if (target != NULL) {
+            // First hook: +100
+            int r1 = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(hook_a::proxy),
+                                      reinterpret_cast<void **>(&orig_atoi_a));
+            if (r1 == 0) {
+                result_pass("multi-hook: first proxy (+100) installed");
+
+                // Second hook: +1000 (chains to first)
+                int r2 = adl_inline_hook(target,
+                                          reinterpret_cast<void *>(hook_b::proxy),
+                                          reinterpret_cast<void **>(&orig_atoi_b));
+                if (r2 == 0) {
+                    result_pass("multi-hook: second proxy (+1000) installed");
+
+                    // atoi("10") → hook_b(+1000) → hook_a(+100) → orig(10) = 1110
+                    volatile int val = atoi("10");
+                    if (val == 10 + 100 + 1000) {
+                        result_pass("multi-hook: atoi(\"10\") = %d (10+100+1000)", val);
+                    } else {
+                        result_fail("multi-hook: atoi(\"10\") = %d, expected 1110", val);
+                    }
+
+                    // Unhook second (most recent)
+                    adl_inline_unhook(target);
+                }
+                // Unhook first
+                adl_inline_unhook(target);
+            } else {
+                result_fail("multi-hook: first hook failed");
+            }
+        }
+        if (handle) adlclose(handle);
+    }
+
+    // 33. Reentrant control test
+    g_result += "\n--- Reentrant control ---\n";
+    {
+        typedef int (*atoi_fn)(const char *);
+        static atoi_fn orig_atoi_re = NULL;
+        static volatile int reentrant_count;
+        reentrant_count = 0;
+
+        struct reentrant_hook {
+            static int proxy(const char *s) {
+                reentrant_count++;
+                if (reentrant_count == 1) {
+                    // First call: trigger a recursive call
+                    volatile int inner = atoi("0");
+                    (void)inner;
+                }
+                return orig_atoi_re(s);
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "atoi") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(reentrant_hook::proxy),
+                                      reinterpret_cast<void **>(&orig_atoi_re));
+            if (ret == 0) {
+                // Default: recursion blocked. Inner atoi("0") should NOT go through proxy.
+                reentrant_count = 0;
+                volatile int val = atoi("42");
+                if (reentrant_count == 1) {
+                    result_pass("default: recursive call blocked (count=%d, val=%d)",
+                                (int)reentrant_count, val);
+                } else {
+                    result_fail("default: count=%d, expected 1", (int)reentrant_count);
+                }
+
+                // Enable reentrant
+                adl_inline_hook_allow_reentrant(target);
+                reentrant_count = 0;
+                val = atoi("42");
+                if (reentrant_count == 2) {
+                    result_pass("reentrant: both calls went through proxy (count=%d)",
+                                (int)reentrant_count);
+                } else {
+                    result_fail("reentrant: count=%d, expected 2", (int)reentrant_count);
+                }
+
+                // Disable reentrant
+                adl_inline_hook_disallow_reentrant(target);
+                reentrant_count = 0;
+                val = atoi("42");
+                if (reentrant_count == 1) {
+                    result_pass("disallow: recursion blocked again (count=%d)",
+                                (int)reentrant_count);
+                } else {
+                    result_fail("disallow: count=%d, expected 1", (int)reentrant_count);
+                }
+
+                adl_inline_unhook(target);
+            } else {
+                result_fail("reentrant test: hook failed");
+            }
+        }
+        if (handle) adlclose(handle);
+    }
+
     // summary
     int pass = 0, fail = 0;
     size_t pos = 0;

@@ -13,7 +13,11 @@
 #include "adl_internal.h"
 
 #define HOOKER_TAG "adl_hooker"
+#ifdef ADL_HOOKER_VERBOSE
 #define HLOGI(...) __android_log_print(ANDROID_LOG_INFO, HOOKER_TAG, __VA_ARGS__)
+#else
+#define HLOGI(...)
+#endif
 #define HLOGE(...) __android_log_print(ANDROID_LOG_ERROR, HOOKER_TAG, __VA_ARGS__)
 
 // Record of a PLT hook for unhook support

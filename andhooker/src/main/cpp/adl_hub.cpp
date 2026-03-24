@@ -1,5 +1,5 @@
 //
-// Hub mechanism: TLS frame stack + runtime code from assembly template
+// Hub mechanism: shared pages, proxy chains, TLS frame stack, reentrant control
 //
 
 #include <sys/mman.h>
@@ -11,7 +11,12 @@
 #include "adl_hub.h"
 
 #define HTAG "adl_hub"
+//#define ADL_HUB_VERBOSE
+#ifdef ADL_HUB_VERBOSE
 #define HLOGI(...) __android_log_print(ANDROID_LOG_INFO, HTAG, __VA_ARGS__)
+#else
+#define HLOGI(...)
+#endif
 #define HLOGE(...) __android_log_print(ANDROID_LOG_ERROR, HTAG, __VA_ARGS__)
 
 // ============================================================================
@@ -20,6 +25,7 @@
 
 typedef struct {
     void *orig_addr;
+    uint32_t flags;
 } adl_hub_frame_t;
 
 typedef struct {
@@ -30,7 +36,6 @@ typedef struct {
 static pthread_key_t g_hub_tls_key;
 static bool g_hub_initialized = false;
 
-// Pre-allocated stack pool (avoid malloc in hot path)
 static adl_hub_stack_t g_stack_pool[ADL_HUB_STACK_POOL_SIZE];
 static volatile uint8_t g_stack_pool_used[ADL_HUB_STACK_POOL_SIZE];
 
@@ -78,12 +83,12 @@ void adl_hub_init(void) {
     memset(g_stack_pool, 0, sizeof(g_stack_pool));
     memset((void *)g_stack_pool_used, 0, sizeof(g_stack_pool_used));
     pthread_key_create(&g_hub_tls_key, free_stack);
-    HLOGI("hub initialized (pool=%d, max_depth=%d)",
-          ADL_HUB_STACK_POOL_SIZE, ADL_HUB_FRAME_MAX);
+    HLOGI("hub initialized (pool=%d, max_depth=%d, slot_size=%d)",
+          ADL_HUB_STACK_POOL_SIZE, ADL_HUB_FRAME_MAX, ADL_HUB_SLOT_SIZE);
 }
 
 // ============================================================================
-// Push / Pop (called by hub assembly)
+// Push / Pop
 // ============================================================================
 
 extern "C" void *adl_hub_push(adl_hub_data_t *data, void *return_addr) {
@@ -96,17 +101,27 @@ extern "C" void *adl_hub_push(adl_hub_data_t *data, void *return_addr) {
     // Check recursion
     for (int i = 0; i < stack->count; i++) {
         if (stack->frames[i].orig_addr == data->orig_addr) {
-            return data->trampoline;  // recursive — skip proxy
+            // Recursive call detected
+            if (data->flags & ADL_HUB_FLAG_ALLOW_REENTRANT) {
+                // Reentrant allowed: push new frame and call proxy again
+                break; // fall through to push
+            }
+            return data->trampoline;  // default: skip proxy
         }
     }
 
-    // Not recursive — push frame and call proxy
+    // Push frame
     if (stack->count < ADL_HUB_FRAME_MAX) {
         stack->frames[stack->count].orig_addr = data->orig_addr;
+        stack->frames[stack->count].flags = data->flags;
         stack->count++;
     }
 
-    return data->proxy_func;
+    // Return first enabled proxy
+    for (adl_hub_proxy_t *p = data->proxies; p != NULL; p = p->next) {
+        if (p->enabled) return p->func;
+    }
+    return data->trampoline;
 }
 
 extern "C" void adl_hub_pop(adl_hub_data_t *data) {
@@ -118,16 +133,123 @@ extern "C" void adl_hub_pop(adl_hub_data_t *data) {
 }
 
 // ============================================================================
+// Proxy chain management
+// ============================================================================
+
+void *adl_hub_add_proxy(adl_hub_data_t *data, void *proxy_func) {
+    adl_hub_proxy_t *proxy = new adl_hub_proxy_t();
+    proxy->func = proxy_func;
+    proxy->enabled = true;
+
+    // New proxy's "orig" points to what the current head points to
+    // If there's an existing head proxy, orig = head proxy's func
+    // If no existing proxy, orig = trampoline
+    if (data->proxies != NULL) {
+        proxy->orig = data->proxies->func;  // chain to previous head
+    } else {
+        proxy->orig = data->trampoline;
+    }
+
+    // Insert at head
+    proxy->next = data->proxies;
+    data->proxies = proxy;
+
+    HLOGI("proxy added: func=%p, orig=%p, chain_depth=%d",
+          proxy_func, proxy->orig,
+          ({int n=0; for(adl_hub_proxy_t*p=data->proxies;p;p=p->next)n++; n;}));
+
+    return proxy->orig;
+}
+
+int adl_hub_remove_proxy(adl_hub_data_t *data, void *proxy_func) {
+    adl_hub_proxy_t **pp = &data->proxies;
+    while (*pp != NULL) {
+        if ((*pp)->func == proxy_func) {
+            adl_hub_proxy_t *removed = *pp;
+
+            // If removing the head, update the next proxy's "orig"
+            // to point to the removed proxy's "orig" (skip over it)
+            if (removed->next != NULL && *pp == data->proxies) {
+                // Next proxy becomes head; its orig should be what removed's orig was
+                // Actually, next proxy already has its own orig set correctly
+                // We just need to unlink
+            }
+
+            *pp = removed->next;
+
+            // Fix chain: if there's a proxy whose orig pointed to removed->func,
+            // update it to point to removed->orig
+            for (adl_hub_proxy_t *p = data->proxies; p != NULL; p = p->next) {
+                if (p->orig == proxy_func) {
+                    p->orig = removed->orig;
+                }
+            }
+
+            HLOGI("proxy removed: func=%p", proxy_func);
+            delete removed;
+            return 0;
+        }
+        pp = &(*pp)->next;
+    }
+    return -1;
+}
+
+// ============================================================================
+// Shared hub page allocator
+// ============================================================================
+
+struct adl_hub_page {
+    void *base;
+    size_t used;
+    adl_hub_page *next;
+};
+
+static adl_hub_page *g_hub_pages = NULL;
+static pthread_mutex_t g_hub_page_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void *alloc_hub_slot(void) {
+    pthread_mutex_lock(&g_hub_page_mutex);
+
+    // Try to find space in existing pages
+    for (adl_hub_page *page = g_hub_pages; page != NULL; page = page->next) {
+        if (page->used + ADL_HUB_SLOT_SIZE <= PAGE_SIZE) {
+            void *slot = static_cast<uint8_t *>(page->base) + page->used;
+            page->used += ADL_HUB_SLOT_SIZE;
+            pthread_mutex_unlock(&g_hub_page_mutex);
+            return slot;
+        }
+    }
+
+    // Need new page
+    void *base = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
+                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+    if (base == MAP_FAILED) {
+        pthread_mutex_unlock(&g_hub_page_mutex);
+        HLOGE("hub page mmap failed");
+        return NULL;
+    }
+
+    adl_hub_page *page = new adl_hub_page();
+    page->base = base;
+    page->used = ADL_HUB_SLOT_SIZE;
+    page->next = g_hub_pages;
+    g_hub_pages = page;
+
+    pthread_mutex_unlock(&g_hub_page_mutex);
+
+    HLOGI("new hub page @%p (slots=%d)", base, (int)(PAGE_SIZE / ADL_HUB_SLOT_SIZE));
+    return base;
+}
+
+// ============================================================================
 // Hub code creation from assembly template
 // ============================================================================
 
 #if defined(__aarch64__)
 
-// Assembly template symbols (defined in adl_hub_arm64.S)
 extern "C" void adl_hub_template_entry(void);
 extern "C" void adl_hub_template_end(void);
 
-// Placeholder values matching adl_hub_arm64.S
 #define PLACEHOLDER_HUB_DATA    0xDEAD000000000001ULL
 #define PLACEHOLDER_PUSH_FN     0xDEAD000000000002ULL
 #define PLACEHOLDER_POP_FN      0xDEAD000000000003ULL
@@ -151,40 +273,33 @@ void *adl_hub_create(adl_hub_data_t *data) {
     uintptr_t tmpl_end = reinterpret_cast<uintptr_t>(adl_hub_template_end);
     size_t tmpl_size = tmpl_end - tmpl_start;
 
-    if (tmpl_size == 0 || tmpl_size > PAGE_SIZE) {
-        HLOGE("hub template size invalid: %zu", tmpl_size);
+    if (tmpl_size == 0 || tmpl_size > ADL_HUB_SLOT_SIZE) {
+        HLOGE("hub template size invalid: %zu (max %d)", tmpl_size, ADL_HUB_SLOT_SIZE);
         return NULL;
     }
 
-    // Allocate executable page
-    void *code = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-                      MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
-    if (code == MAP_FAILED) {
-        HLOGE("hub mmap failed");
-        return NULL;
-    }
+    void *slot = alloc_hub_slot();
+    if (slot == NULL) return NULL;
 
-    // Copy template
-    memcpy(code, reinterpret_cast<void *>(tmpl_start), tmpl_size);
+    memcpy(slot, reinterpret_cast<void *>(tmpl_start), tmpl_size);
 
-    // Patch placeholders with real addresses
-    patch_placeholder(static_cast<uint8_t *>(code), tmpl_size,
+    patch_placeholder(static_cast<uint8_t *>(slot), tmpl_size,
                       PLACEHOLDER_HUB_DATA, reinterpret_cast<uint64_t>(data));
-    patch_placeholder(static_cast<uint8_t *>(code), tmpl_size,
+    patch_placeholder(static_cast<uint8_t *>(slot), tmpl_size,
                       PLACEHOLDER_PUSH_FN, reinterpret_cast<uint64_t>(&adl_hub_push));
-    patch_placeholder(static_cast<uint8_t *>(code), tmpl_size,
+    patch_placeholder(static_cast<uint8_t *>(slot), tmpl_size,
                       PLACEHOLDER_POP_FN, reinterpret_cast<uint64_t>(&adl_hub_pop));
 
-    // Flush instruction cache
-    __builtin___clear_cache(static_cast<char *>(code),
-                            static_cast<char *>(code) + tmpl_size);
+    __builtin___clear_cache(static_cast<char *>(slot),
+                            static_cast<char *>(slot) + tmpl_size);
 
-    HLOGI("hub created: template=%zu bytes, entry@%p, data@%p",
-          tmpl_size, code, data);
-    return code;
+    data->hub_slot = slot;
+    HLOGI("hub created: %zu bytes in shared slot @%p, data@%p",
+          tmpl_size, slot, data);
+    return slot;
 }
 
-#else // !__aarch64__
+#else
 
 void *adl_hub_create(adl_hub_data_t *data) {
     adl_hub_init();
@@ -197,5 +312,6 @@ void *adl_hub_create(adl_hub_data_t *data) {
 
 void adl_hub_destroy(void *hub_entry) {
     (void)hub_entry;
-    // Don't munmap — other threads may still reference it
+    // Slots are not freed — shared pages persist for process lifetime
+    // This prevents use-after-free from other threads referencing the hub code
 }

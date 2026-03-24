@@ -61,11 +61,33 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func);
 
 /**
  * Inline unhook: restore the original function entry.
+ * If multiple hooks are chained on the same function, removes the most recent one.
+ * When the last hook is removed, the original function is fully restored.
  *
  * @param target_func Same pointer used in adl_inline_hook
  * @return 0 on success, -1 on error
  */
 int adl_inline_unhook(void *target_func);
+
+/**
+ * Allow reentrant calls for an inline-hooked function.
+ * By default, recursive calls to a hooked function skip the proxy (recursion guard).
+ * Calling this allows recursive calls to also go through the proxy.
+ * Useful for thread-pool scenarios where the same function is legitimately
+ * called recursively across task boundaries.
+ *
+ * @param target_func Same pointer used in adl_inline_hook
+ * @return 0 on success, -1 if not found
+ */
+int adl_inline_hook_allow_reentrant(void *target_func);
+
+/**
+ * Disallow reentrant calls (restore default recursion guard behavior).
+ *
+ * @param target_func Same pointer used in adl_inline_hook
+ * @return 0 on success, -1 if not found
+ */
+int adl_inline_hook_disallow_reentrant(void *target_func);
 
 __END_DECLS
 
