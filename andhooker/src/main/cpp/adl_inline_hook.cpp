@@ -176,6 +176,7 @@ static void *detect_fortify_wrapper(void *target_func, void **out_raw_target) {
     const char *lib_name = info.dli_fname;
 
     // Step 2: try __<name>_chk and __<name>_2 patterns
+    // These are probes — clear any error they produce (don't pollute adlerror)
     char fortify_name[256];
     void *lib_handle = adlopen(lib_name, 0);
     if (lib_handle == NULL) return NULL;
@@ -183,9 +184,10 @@ static void *detect_fortify_wrapper(void *target_func, void **out_raw_target) {
     // Try __<name>_chk
     snprintf(fortify_name, sizeof(fortify_name), "__%s_chk", sym_name);
     void *chk_addr = adlsym(lib_handle, fortify_name);
+    adlerror(); // consume any error from probe
     if (chk_addr != NULL) {
         HLOGI("FORTIFY detected: %s -> %s @ %p", sym_name, fortify_name, chk_addr);
-        *out_raw_target = target_func;  // orig points to raw function (no FORTIFY check)
+        *out_raw_target = target_func;
         adlclose(lib_handle);
         return chk_addr;
     }
@@ -193,6 +195,7 @@ static void *detect_fortify_wrapper(void *target_func, void **out_raw_target) {
     // Try __<name>_2 (for open, openat, etc.)
     snprintf(fortify_name, sizeof(fortify_name), "__%s_2", sym_name);
     void *v2_addr = adlsym(lib_handle, fortify_name);
+    adlerror(); // consume any error from probe
     if (v2_addr != NULL) {
         HLOGI("FORTIFY detected: %s -> %s @ %p", sym_name, fortify_name, v2_addr);
         *out_raw_target = target_func;

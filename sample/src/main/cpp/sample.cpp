@@ -996,8 +996,8 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
-    // 25. Inline hook: short function (getpid, ~12 bytes)
-    g_result += "\n--- Inline hook: getpid (short func) ---\n";
+    // 25. Inline hook: getpid (observe mode)
+    g_result += "\n--- Inline hook: getpid ---\n";
     {
         typedef pid_t (*getpid_fn)(void);
         static getpid_fn orig_getpid = NULL;
@@ -1281,6 +1281,43 @@ static void adl_test() {
         } else {
             result_fail("adl_plt_hook(__vsnprintf_chk) failed");
         }
+    }
+
+    // 31. Inline hook: atol (short function, 12 bytes — should be rejected)
+    g_result += "\n--- Inline hook: atol (short func) ---\n";
+    {
+        typedef long (*atol_fn)(const char *);
+        static atol_fn orig_atol = NULL;
+
+        struct atol_hook {
+            static long hooked(const char *s) {
+                return orig_atol(s) * 2;
+            }
+        };
+
+        void *handle = adlopen(BASENAME_LIBC, 0);
+        void *target = handle ? adlsym(handle, "atol") : NULL;
+        if (target != NULL) {
+            int ret = adl_inline_hook(target,
+                                      reinterpret_cast<void *>(atol_hook::hooked),
+                                      reinterpret_cast<void **>(&orig_atol));
+            if (ret == -1) {
+                const char *err = adlerror();
+                result_pass("atol hook rejected (too short): %s", err ? err : "no error msg");
+            } else if (ret == 0) {
+                // Hook succeeded despite being short — test it anyway
+                volatile long val = atol("123");
+                if (val == 246) {
+                    result_pass("atol hooked despite short size: atol(\"123\") = %ld", val);
+                } else {
+                    result_fail("atol hooked but wrong result: %ld", val);
+                }
+                adl_inline_unhook(target);
+            }
+        } else {
+            result_fail("adlsym(atol) not found");
+        }
+        if (handle) adlclose(handle);
     }
 
     // summary
