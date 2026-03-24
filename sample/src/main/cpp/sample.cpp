@@ -121,7 +121,7 @@ static void *resolve_sym(const char *filename, const char *symbol,
     return addr;
 }
 
-static void adl_test() {【】
+static void adl_test() {
     g_result.clear();
 
     int api = android_get_device_api_level();

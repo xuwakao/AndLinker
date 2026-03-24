@@ -267,6 +267,41 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
         return -1;
     }
 
+    // Short function detection: check st_size via adladdr
+    {
+        Dl_info dl_info;
+        if (adladdr(target_func, &dl_info) != 0 && dl_info.dli_sname != NULL) {
+            // Find symbol size by looking up in the library
+            void *lib = adlopen(dl_info.dli_fname, 0);
+            if (lib != NULL) {
+                // Use adl_enum_symbols to find st_size for this symbol
+                struct { const char *name; void *addr; size_t size; } sym_info = {
+                    dl_info.dli_sname, target_func, 0
+                };
+                adl_enum_symbols(lib, [](const char *name, void *addr, size_t size,
+                                          int type, void *arg) -> int {
+                    auto *info = static_cast<decltype(sym_info) *>(arg);
+                    if (addr == info->addr || (name && info->name && strcmp(name, info->name) == 0)) {
+                        info->size = size;
+                        return 1; // stop
+                    }
+                    return 0;
+                }, &sym_info);
+                adlclose(lib);
+
+                if (sym_info.size > 0 && sym_info.size < hook_size) {
+                    HLOGE("adl_inline_hook: function %s at %p is too short (%zu bytes < hook_size %zu)",
+                          dl_info.dli_sname, target_func, sym_info.size, hook_size);
+                    return -1;
+                }
+                if (sym_info.size > 0) {
+                    HLOGI("adl_inline_hook: function %s size=%zu, hook_size=%zu (OK)",
+                          dl_info.dli_sname, sym_info.size, hook_size);
+                }
+            }
+        }
+    }
+
     // Allocate trampoline
     void *trampoline = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
                             MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);

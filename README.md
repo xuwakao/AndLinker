@@ -297,7 +297,9 @@ Android's `_FORTIFY_SOURCE` replaces many libc functions with checked versions a
 
 ### Short Functions
 
-Functions shorter than 16 bytes (ARM64 hook size) may overlap with adjacent functions. The framework attempts the hook but logs a warning. Observe-only hooks are generally safe for short functions.
+Functions shorter than 16 bytes (ARM64 hook size) cannot be safely inline hooked — the patch would overwrite adjacent functions. The framework detects this at runtime via `st_size` from the symbol table and **rejects the hook with an error** (`adl_inline_hook` returns -1). Examples: `atol` (12 bytes), `strptime` (8 bytes), `getopt_long_only` (8 bytes).
+
+For short functions, use **PLT hook** instead (no size restriction since it only modifies a GOT pointer).
 
 ## Build
 
