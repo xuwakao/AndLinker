@@ -87,6 +87,7 @@ typedef struct so_info {
     bool has_DT_SYMBOLIC;
 
     adl_tls_segment *tls_segment;
+    size_t tls_module_id;
 
     // version >= 2
     size_t gnu_nbucket_;
@@ -449,6 +450,16 @@ static int adl_find_library_callback(struct dl_phdr_info *info,
     (*soInfo)->phdr = info->dlpi_phdr;
     (*soInfo)->phnum = info->dlpi_phnum;
     (*soInfo)->flags_ = ADL_FLAG_NEW_SOINFO;
+
+    // dlpi_tls_modid available on API 30+ (after dlpi_adds + dlpi_subs fields)
+    static const size_t kTlsModidOffset =
+            sizeof(ElfW(Addr)) + sizeof(const char *) + sizeof(const ElfW(Phdr) *) +
+            sizeof(ElfW(Half)) + sizeof(unsigned long long) * 2;
+    if (size >= kTlsModidOffset + sizeof(size_t)) {
+        (*soInfo)->tls_module_id = *reinterpret_cast<const size_t *>(
+                reinterpret_cast<const char *>(info) + kTlsModidOffset);
+    }
+
     return 1;
 }
 
@@ -552,6 +563,15 @@ adl_find_containing_library_callback(struct dl_phdr_info *info,
             (*soInfo)->phdr = info->dlpi_phdr;
             (*soInfo)->phnum = info->dlpi_phnum;
             (*soInfo)->flags_ = ADL_FLAG_NEW_SOINFO;
+
+            static const size_t kTlsModidOffset =
+                    sizeof(ElfW(Addr)) + sizeof(const char *) + sizeof(const ElfW(Phdr) *) +
+                    sizeof(ElfW(Half)) + sizeof(unsigned long long) * 2;
+            if (size >= kTlsModidOffset + sizeof(size_t)) {
+                (*soInfo)->tls_module_id = *reinterpret_cast<const size_t *>(
+                        reinterpret_cast<const char *>(info) + kTlsModidOffset);
+            }
+
             return 1;
         }
     }
@@ -1197,9 +1217,31 @@ bool adl_do_dlsym(void *handle, const char *sym_name, const char *sym_ver, void 
                     return false;
                 }
 
-                // TLS symbol resolution requires the module's TLS ID from linker-internal
-                // soinfo, which is not accessible without version-specific struct offsets.
-                ADLOGW("TLS symbol \"%s\" in \"%s\" is not supported by adlsym",
+                // API 30+: use __tls_get_addr with module_id from dl_phdr_info
+                if (soInfo->tls_module_id != 0) {
+                    typedef void *(*tls_get_addr_t)(void *);
+                    static tls_get_addr_t tls_get_addr = reinterpret_cast<tls_get_addr_t>(
+                            dlsym(RTLD_DEFAULT, "__tls_get_addr"));
+                    if (tls_get_addr != NULL) {
+                        struct { size_t mod; size_t off; } ti = {
+                                soInfo->tls_module_id, sym->st_value };
+                        *symbol = tls_get_addr(&ti);
+                        if (*symbol != NULL) return true;
+                    }
+                }
+
+                // Fallback: use standard dlsym for exported TLS symbols
+                {
+                    void *handle = soInfo->dlopen_handle
+                                   ? soInfo->dlopen_handle : RTLD_DEFAULT;
+                    void *result = dlsym(handle, sym_name);
+                    if (result != NULL) {
+                        *symbol = result;
+                        return true;
+                    }
+                }
+
+                ADLOGW("TLS symbol \"%s\" in \"%s\" resolution failed",
                        sym_name, soInfo->filename);
                 return false;
             } else {

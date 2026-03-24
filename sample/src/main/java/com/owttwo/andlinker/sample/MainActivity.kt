@@ -1,6 +1,10 @@
 package com.owttwo.andlinker.sample
 
+import android.graphics.Color
 import android.os.Bundle
+import android.text.SpannableString
+import android.text.Spanned
+import android.text.style.ForegroundColorSpan
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 
@@ -9,19 +13,51 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        findViewById<TextView>(R.id.sample_text).setOnClickListener {
-            findViewById<TextView>(R.id.sample_text).text = stringFromJNI()
+        val textView = findViewById<TextView>(R.id.sample_text)
+        textView.text = colorize(stringFromJNI())
+        textView.setOnClickListener {
+            textView.text = colorize(stringFromJNI())
         }
     }
 
-    /**
-     * A native method that is implemented by the 'native-lib' native library,
-     * which is packaged with this application.
-     */
+    private fun colorize(text: String): SpannableString {
+        val spannable = SpannableString(text)
+        val green = Color.parseColor("#4CAF50")
+        val red = Color.parseColor("#F44336")
+        val gray = Color.parseColor("#9E9E9E")
+
+        var index = 0
+        while (index < text.length) {
+            val lineEnd = text.indexOf('\n', index).let { if (it == -1) text.length else it }
+
+            when {
+                text.startsWith("[PASS]", index) -> {
+                    spannable.setSpan(
+                        ForegroundColorSpan(green), index, lineEnd,
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                }
+                text.startsWith("[FAIL]", index) -> {
+                    spannable.setSpan(
+                        ForegroundColorSpan(red), index, lineEnd,
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                }
+                text.startsWith("---", index) || text.startsWith("===", index) -> {
+                    spannable.setSpan(
+                        ForegroundColorSpan(gray), index, lineEnd,
+                        Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                    )
+                }
+            }
+            index = lineEnd + 1
+        }
+        return spannable
+    }
+
     external fun stringFromJNI(): String
 
     companion object {
-        // Used to load the 'native-lib' library on application startup.
         init {
             System.loadLibrary("adl")
             System.loadLibrary("sample")

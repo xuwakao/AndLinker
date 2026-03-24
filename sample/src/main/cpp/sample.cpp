@@ -4,21 +4,15 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <time.h>
-#include <unordered_map>
+#include <fcntl.h>
 
 #include "adl.h"
 
-// log
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wgnu-zero-variadic-macro-arguments"
 #define LOG(fmt, ...) __android_log_print(ANDROID_LOG_INFO, "adl_sample", fmt, ##__VA_ARGS__)
 #define LOGE(fmt, ...) __android_log_print(ANDROID_LOG_ERROR, "adl_sample", fmt, ##__VA_ARGS__)
 #pragma clang diagnostic pop
-
-#define LOG_BEGIN(TAG) LOG("*** %s", (const char*)TAG)
-#define LOG_BEGIN_FMT(fmt, ...) LOG(fmt, ##__VA_ARGS__)
-#define LOG_END LOG("*** -----------------------------------------")
-
 
 #define BASENAME_LIBC     "libc.so"
 #define BASENAME_LIBCPP   "libc++.so"
@@ -26,156 +20,241 @@
 #if defined(__LP64__)
 #define BASENAME_LINKER   "linker64"
 #define PATHNAME_LIBCPP   "/system/lib64/libc++.so"
-#define PATHNAME_LIBCURL      "/system/lib64/libcurl.so"
+#define PATHNAME_LIBCURL  "/system/lib64/libcurl.so"
 #else
 #define BASENAME_LINKER   "linker"
 #define PATHNAME_LIBCPP   "/system/lib/libc++.so"
-#define PATHNAME_LIBCURL      "/system/lib/libcurl.so"
+#define PATHNAME_LIBCURL  "/system/lib/libcurl.so"
 #endif
 
-std::unordered_map<uintptr_t, void *> *g_soinfo_handles;
+static std::string g_result;
 
-static int callback(struct dl_phdr_info *info, size_t size, void *arg) {
+static void result_pass(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    LOG("[PASS] %s", buf);
+    g_result += "[PASS] ";
+    g_result += buf;
+    g_result += "\n";
+}
+
+static void result_fail(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    LOGE("[FAIL] %s", buf);
+    g_result += "[FAIL] ";
+    g_result += buf;
+    g_result += "\n";
+}
+
+static void result_info(const char *fmt, ...) {
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    LOG("  %s", buf);
+    g_result += "  ";
+    g_result += buf;
+    g_result += "\n";
+}
+
+static int iterate_callback(struct dl_phdr_info *info, size_t size, void *arg) {
+    (void) size;
+    int *count = static_cast<int *>(arg);
+    (*count)++;
     return 0;
 }
 
-static void adl_test_iterate(void) {
-    LOG_BEGIN("adl_test_iterate");
-    adl_iterate_phdr(callback, NULL);
-    LOG_END;
-    usleep(100 * 1000);
+// Helper: read first 4 bytes at address to verify it's readable
+static void verify_readable(void *addr, const char *name) {
+    uint8_t *p = static_cast<uint8_t *>(addr);
+    result_info("verify: %s bytes=[%02x %02x %02x %02x]",
+                name, p[0], p[1], p[2], p[3]);
 }
 
-static void *
-adl_test_dlsym(const char *filename, const char *symbol,
-               uintptr_t *out_sym_addr, bool open_lib) {
-    if (open_lib) {
-        void *handle = dlopen(filename, RTLD_NOW);
-        LOG("--- dlopen(%s) : handle %p", filename, (uintptr_t) handle);
-        if (NULL != handle)
-            dlclose(handle);
+// Open + sym + adladdr, returns symbol address (caller must adlclose handle)
+static void *resolve_sym(const char *filename, const char *symbol,
+                         void **out_handle, bool pre_dlopen,
+                         void **out_pre_handle = NULL) {
+    if (out_pre_handle) *out_pre_handle = NULL;
+    if (pre_dlopen) {
+        void *h = dlopen(filename, RTLD_NOW);
+        if (out_pre_handle) *out_pre_handle = h;
     }
 
-    LOG_BEGIN("adl_test_dlsym");
-
-    // adlopen
     void *handle = adlopen(filename, 0);
-    if (NULL != handle)
-        LOG(">>> adlopen(%s) : handle %p", filename, (uintptr_t) handle);
-    else {
-        LOGE("xxx adlopen(%s) failed", filename);
+    if (handle == NULL) {
+        result_fail("adlopen(%s)", filename);
+        *out_handle = NULL;
+        return NULL;
+    }
+    result_pass("adlopen(%s)", filename);
+    *out_handle = handle;
+
+    void *addr = adlsym(handle, symbol);
+    if (addr != NULL) {
+        result_pass("adlsym(%s) -> %p", symbol, addr);
+    } else {
+        result_fail("adlsym(%s)", symbol);
         return NULL;
     }
 
-    // adlsym
-    void *symbol_addr = adlsym(handle, symbol);
-    if (NULL != symbol_addr) {
-        LOG(">>> adlsym(%s) : addr %p", symbol, (uintptr_t) symbol_addr);
-        *out_sym_addr = reinterpret_cast<uintptr_t>(symbol_addr);
+    Dl_info info;
+    if (adladdr(addr, &info) != 0 && info.dli_saddr != NULL) {
+        result_pass("adladdr(%s) -> %s in %s", symbol, info.dli_sname, info.dli_fname);
     } else {
-        LOGE("xxx adlsym(%s) not found", symbol);
+        result_fail("adladdr(%s)", symbol);
     }
 
-    // adladdr
-    Dl_info info;
-    if (NULL != symbol_addr && 0 != adladdr(symbol_addr, &info)) {
-        if (0 == info.dli_saddr) {
-            LOGE("xxx adladdr(%p) not found: %p, %s", (uintptr_t) symbol_addr,
-                 (uintptr_t) info.dli_fbase, info.dli_fname);
-        } else {
-            LOG(">>> adladdr(%p) : %p, %s, %p %s", (uintptr_t) symbol_addr,
-                (uintptr_t) info.dli_fbase, info.dli_fname,
-                (uintptr_t) info.dli_saddr, info.dli_sname);
-        }
-    } else
-        LOGE("xxx adladdr(%p) failed ", (uintptr_t) symbol_addr);
-
-
-    LOG_END;
-
-    return handle;
+    return addr;
 }
 
-typedef int *(*gettimeofday_t)(struct timeval *tv, struct timezone *tz);
+static void adl_test() {
+    g_result.clear();
 
-typedef int *(*__loader_android_get_application_target_sdk_version)(void);
-
-static void adl_test(JNIEnv *env, jobject thiz) {
-    (void) env;
-    (void) thiz;
-
-    adl_test_iterate();
+    int api = android_get_device_api_level();
+    char header[128];
+    snprintf(header, sizeof(header),
+             "=== AndLinker Test (API %d, %s) ===\n\n",
+             api,
+#if defined(__LP64__)
+             "64-bit"
+#else
+             "32-bit"
+#endif
+    );
+    g_result += header;
 
     void *handle = NULL;
-    uintptr_t symbol_addr = 0;
-    // linker
-    //inner symbol : >= 11.0
-    adl_test_dlsym(BASENAME_LINKER, "__dl__Z14get_libdl_infoRK6soinfo", &symbol_addr, false);
-    //export symbol : >= 9.0
-    adl_test_dlsym(BASENAME_LINKER, "__loader_android_get_LD_LIBRARY_PATH", &symbol_addr, false);
-    //global static field symbol : g_soinfo_handles_map
-    if (android_get_device_api_level() >= 26) {//android 8.0
-        uintptr_t c_handle = reinterpret_cast<uintptr_t>(dlopen(BASENAME_LIBC, RTLD_NOW));
-        adl_test_dlsym(BASENAME_LINKER, "__dl_g_soinfo_handles_map", &symbol_addr, false);
-        g_soinfo_handles = reinterpret_cast<std::unordered_map
-                <uintptr_t, void *> *>(symbol_addr);
-        for (std::unordered_map<uintptr_t, void *>::iterator it =
-                g_soinfo_handles->begin(); it != g_soinfo_handles->end(); ++it) {
-            if (c_handle == it->first) {//find the c so
-                uintptr_t sym = reinterpret_cast<uintptr_t>(
-                        dlsym((void *) it->first,
-                              "__loader_android_get_application_target_sdk_version"));
-                if (sym != NULL) {
-                    LOG("g_soinfo_handles 0x%llx, %p, 0x%llx", it->first, it->second, sym);
-                    __loader_android_get_application_target_sdk_version
-                            sdk_version_get = reinterpret_cast<__loader_android_get_application_target_sdk_version>(sym);
-                    LOG("C handle  sdk version : %d",
-                        sdk_version_get());
-                }
+    void *addr = NULL;
 
-                sym = reinterpret_cast<uintptr_t>(dlsym((void *) it->first,
-                                                        "gettimeofday"));
-                if (sym != NULL) {
-                    gettimeofday_t today = reinterpret_cast<gettimeofday_t>(sym);
-                    struct timeval tv;
-                    today(&tv, NULL);
-                    struct tm *info = localtime(reinterpret_cast<const time_t *>(&tv));
-                    LOG("C handle Now is %s", asctime(info));
-                }
-            }
+    // 1. iterate test
+    g_result += "--- adl_iterate_phdr ---\n";
+    {
+        int count = 0;
+        adl_iterate_phdr(iterate_callback, &count);
+        if (count > 0)
+            result_pass("adl_iterate_phdr -> %d libraries", count);
+        else
+            result_fail("adl_iterate_phdr -> 0 libraries");
+    }
+
+    // 2. linker: __loader_android_get_LD_LIBRARY_PATH
+    g_result += "\n--- linker: get_LD_LIBRARY_PATH ---\n";
+    addr = resolve_sym(BASENAME_LINKER, "__loader_android_get_LD_LIBRARY_PATH", &handle, false);
+    if (addr != NULL) {
+        typedef void (*get_ld_path_t)(char *, size_t);
+        get_ld_path_t fn = reinterpret_cast<get_ld_path_t>(addr);
+        char path_buf[512] = {0};
+        fn(path_buf, sizeof(path_buf));
+        if (path_buf[0] != '\0')
+            result_pass("call -> LD_LIBRARY_PATH=\"%s\"", path_buf);
+        else
+            result_pass("call -> LD_LIBRARY_PATH=(empty)");
+    }
+    if (handle) adlclose(handle);
+
+    // 3. linker: internal symbol (API 30+)
+    if (api >= 30) {
+        g_result += "\n--- linker: get_libdl_info (API 30+) ---\n";
+        addr = resolve_sym(BASENAME_LINKER, "__dl__Z14get_libdl_infoRK6soinfo", &handle, false);
+        if (addr != NULL) {
+            verify_readable(addr, "__dl__Z14get_libdl_infoRK6soinfo");
         }
-        if (c_handle != NULL)
-            dlclose(reinterpret_cast<void *>(c_handle));
+        if (handle) adlclose(handle);
     }
 
-    // libc.so
-    //inner symbol
-    adl_test_dlsym(BASENAME_LIBC, "__openat", &symbol_addr, false);
-    //export symbol
-    adl_test_dlsym(BASENAME_LIBC, "gettimeofday", &symbol_addr, false);
-    gettimeofday_t today = reinterpret_cast<gettimeofday_t>(symbol_addr);
-    struct timeval tv;
-    today(&tv, NULL);
-    struct tm *info = localtime(reinterpret_cast<const time_t *>(&tv));
-    LOG("Now is %s", asctime(info));
-
-    // libc++.so
-    adl_test_dlsym(BASENAME_LIBCPP, "_ZNSt3__18valarrayImEC2Em", &symbol_addr, false);
-    adl_test_dlsym(PATHNAME_LIBCPP, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE3putEc",
-                   &symbol_addr, false);
-
-    //load elf file
-    handle = adl_test_dlsym(PATHNAME_LIBCURL, "Curl_open", &symbol_addr, true);
-    if (handle != NULL) {
-        adlclose(handle);
+    // 4. libc: __openat (internal)
+    g_result += "\n--- libc: __openat ---\n";
+    addr = resolve_sym(BASENAME_LIBC, "__openat", &handle, false);
+    if (addr != NULL) {
+        typedef int (*openat_t)(int, const char *, int, ...);
+        openat_t fn = reinterpret_cast<openat_t>(addr);
+        int fd = fn(AT_FDCWD, "/proc/self/maps", O_RDONLY);
+        if (fd >= 0) {
+            char buf[64] = {0};
+            ssize_t n = read(fd, buf, sizeof(buf) - 1);
+            close(fd);
+            result_pass("call -> openat(/proc/self/maps) fd=%d, read %zd bytes", fd, n);
+        } else {
+            result_fail("call -> openat(/proc/self/maps) failed errno=%d", errno);
+        }
     }
+    if (handle) adlclose(handle);
+
+    // 5. libc: gettimeofday (export)
+    g_result += "\n--- libc: gettimeofday ---\n";
+    addr = resolve_sym(BASENAME_LIBC, "gettimeofday", &handle, false);
+    if (addr != NULL) {
+        typedef int (*gettimeofday_t)(struct timeval *, struct timezone *);
+        gettimeofday_t fn = reinterpret_cast<gettimeofday_t>(addr);
+        struct timeval tv;
+        int ret = fn(&tv, NULL);
+        if (ret == 0) {
+            struct tm *tm_info = localtime(reinterpret_cast<const time_t *>(&tv));
+            char time_buf[64];
+            strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", tm_info);
+            result_pass("call -> gettimeofday() = %s", time_buf);
+        } else {
+            result_fail("call -> gettimeofday() ret=%d", ret);
+        }
+    }
+    if (handle) adlclose(handle);
+
+    // 6. libc++: valarray constructor
+    g_result += "\n--- libc++: valarray<size_t> ctor ---\n";
+    addr = resolve_sym(BASENAME_LIBCPP, "_ZNSt3__18valarrayImEC2Em", &handle, false);
+    if (addr != NULL) {
+        verify_readable(addr, "valarray::valarray(size_t)");
+    }
+    if (handle) adlclose(handle);
+
+    // 7. libc++: ostream::put
+    g_result += "\n--- libc++: ostream::put ---\n";
+    addr = resolve_sym(PATHNAME_LIBCPP, "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE3putEc",
+                        &handle, false);
+    if (addr != NULL) {
+        verify_readable(addr, "ostream::put(char)");
+    }
+    if (handle) adlclose(handle);
+
+    // 8. libcurl: Curl_open (keep loaded to stabilize address across runs)
+    g_result += "\n--- libcurl: Curl_open ---\n";
+    {
+        static void *curl_dl_handle = NULL;
+        if (curl_dl_handle == NULL) {
+            curl_dl_handle = dlopen(PATHNAME_LIBCURL, RTLD_NOW);
+        }
+        addr = resolve_sym(PATHNAME_LIBCURL, "Curl_open", &handle, false);
+        if (addr != NULL) {
+            verify_readable(addr, "Curl_open");
+        }
+        // don't adlclose — keep handle alive so address stays stable
+    }
+
+    // summary
+    int pass = 0, fail = 0;
+    size_t pos = 0;
+    while ((pos = g_result.find("[PASS]", pos)) != std::string::npos) { pass++; pos++; }
+    pos = 0;
+    while ((pos = g_result.find("[FAIL]", pos)) != std::string::npos) { fail++; pos++; }
+    char summary[128];
+    snprintf(summary, sizeof(summary), "\n=== %d passed, %d failed ===\n", pass, fail);
+    g_result += summary;
 }
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_com_owttwo_andlinker_sample_MainActivity_stringFromJNI(
         JNIEnv *env,
         jobject thiz) {
-    std::string hello = "ADL C++";
-    adl_test(env, thiz);
-    return env->NewStringUTF(hello.c_str());
+    (void) thiz;
+    adl_test();
+    return env->NewStringUTF(g_result.c_str());
 }
