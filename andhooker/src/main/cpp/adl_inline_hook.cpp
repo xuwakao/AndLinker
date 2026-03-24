@@ -6,11 +6,15 @@
 #include <sys/user.h>
 #include <string.h>
 #include <errno.h>
+#include <stdio.h>
 #include <android/log.h>
+
+#include <dlfcn.h>
 
 #include "adl_hook.h"
 #include "adl_hub.h"
 #include "adl_relocate.h"
+#include "adl.h"
 
 #define HOOKER_TAG "adl_hooker"
 #define HLOGI(...) __android_log_print(ANDROID_LOG_INFO, HOOKER_TAG, __VA_ARGS__)
@@ -34,13 +38,14 @@
 // ============================================================================
 
 struct inline_hook_record {
-    void *target;
+    void *target;           // actual hooked address (may be FORTIFY wrapper)
+    void *user_target;      // address user passed in (for unhook matching)
     size_t hook_size;
     uint8_t orig_bytes[64];
     void *trampoline;
     bool is_thumb;
-    adl_hub_data_t *hub_data;  // hub data (owns lifecycle)
-    void *hub_entry;           // hub code entry point
+    adl_hub_data_t *hub_data;
+    void *hub_entry;
     inline_hook_record *next;
 };
 
@@ -153,6 +158,53 @@ static void ordered_write_unhook(void *target, const uint8_t *orig_bytes, size_t
 }
 
 // ============================================================================
+// FORTIFY auto-detection
+// ============================================================================
+
+// Try to find FORTIFY wrapper for a given function address.
+// Returns the FORTIFY wrapper address, or NULL if none found.
+// Also returns the original function's trampoline-safe address via orig_raw.
+static void *detect_fortify_wrapper(void *target_func, void **out_raw_target) {
+    *out_raw_target = target_func;
+
+    // Step 1: reverse-lookup symbol name from address
+    Dl_info info;
+    if (adladdr(target_func, &info) == 0 || info.dli_sname == NULL) {
+        return NULL;
+    }
+    const char *sym_name = info.dli_sname;
+    const char *lib_name = info.dli_fname;
+
+    // Step 2: try __<name>_chk and __<name>_2 patterns
+    char fortify_name[256];
+    void *lib_handle = adlopen(lib_name, 0);
+    if (lib_handle == NULL) return NULL;
+
+    // Try __<name>_chk
+    snprintf(fortify_name, sizeof(fortify_name), "__%s_chk", sym_name);
+    void *chk_addr = adlsym(lib_handle, fortify_name);
+    if (chk_addr != NULL) {
+        HLOGI("FORTIFY detected: %s -> %s @ %p", sym_name, fortify_name, chk_addr);
+        *out_raw_target = target_func;  // orig points to raw function (no FORTIFY check)
+        adlclose(lib_handle);
+        return chk_addr;
+    }
+
+    // Try __<name>_2 (for open, openat, etc.)
+    snprintf(fortify_name, sizeof(fortify_name), "__%s_2", sym_name);
+    void *v2_addr = adlsym(lib_handle, fortify_name);
+    if (v2_addr != NULL) {
+        HLOGI("FORTIFY detected: %s -> %s @ %p", sym_name, fortify_name, v2_addr);
+        *out_raw_target = target_func;
+        adlclose(lib_handle);
+        return v2_addr;
+    }
+
+    adlclose(lib_handle);
+    return NULL;
+}
+
+// ============================================================================
 // Public API
 // ============================================================================
 
@@ -160,6 +212,18 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
     if (target_func == NULL || new_func == NULL) {
         HLOGE("adl_inline_hook: invalid arguments");
         return -1;
+    }
+
+    // FORTIFY auto-detection: if target has a __xxx_chk wrapper, hook that instead.
+    // orig_func will point to the raw function (not FORTIFY), so user's proxy
+    // can call orig(args) with the original function signature.
+    void *raw_target = target_func;
+    void *fortify_target = detect_fortify_wrapper(target_func, &raw_target);
+    if (fortify_target != NULL) {
+        // Hook the FORTIFY wrapper; trampoline for orig points to raw function
+        target_func = fortify_target;
+        HLOGI("FORTIFY auto-hook: actual target changed to %p, orig will use raw %p",
+              target_func, raw_target);
     }
 
     bool is_thumb = false;
@@ -263,14 +327,22 @@ int adl_inline_hook(void *target_func, void *new_func, void **orig_func) {
     // Write hook with ordered writes (thread-safe)
     ordered_write_hook(target_func, jump_target, hook_size, is_thumb);
 
-    // Return trampoline to caller
+    // Return orig function pointer to caller
     if (orig_func != NULL) {
-        *orig_func = trampoline_for_caller;
+        if (fortify_target != NULL) {
+            // FORTIFY mode: orig points to raw function (matching user's expected signature)
+            // e.g., user hooks strlen → we hook __strlen_chk → orig returns raw strlen
+            *orig_func = raw_target;
+            HLOGI("FORTIFY: orig_func set to raw function %p (not FORTIFY trampoline)", raw_target);
+        } else {
+            *orig_func = trampoline_for_caller;
+        }
     }
 
     // Save record
     inline_hook_record *record = new inline_hook_record();
     record->target = target_func;
+    record->user_target = raw_target;
     record->hook_size = hook_size;
     memcpy(record->orig_bytes, orig_bytes, hook_size);
     record->trampoline = trampoline;
@@ -292,13 +364,14 @@ int adl_inline_unhook(void *target_func) {
 
     inline_hook_record **pp = &g_inline_hooks;
     while (*pp != NULL) {
-        if ((*pp)->target == target_func) {
+        // Match by user_target (original address user passed) OR actual target
+        if ((*pp)->user_target == target_func || (*pp)->target == target_func) {
             inline_hook_record *record = *pp;
 
-            if (make_writable(target_func, record->hook_size) != 0) return -1;
+            if (make_writable(record->target, record->hook_size) != 0) return -1;
 
-            // Ordered unhook write
-            ordered_write_unhook(target_func, record->orig_bytes, record->hook_size);
+            // Ordered unhook write — restore to actual hooked address
+            ordered_write_unhook(record->target, record->orig_bytes, record->hook_size);
 
             // Do NOT munmap trampoline — JIT or other threads may still reference it.
             // The 4KB page will be reclaimed when the process exits.

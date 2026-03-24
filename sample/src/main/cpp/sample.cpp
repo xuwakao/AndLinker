@@ -826,18 +826,22 @@ static void adl_test() {
         if (handle) adlclose(handle);
     }
 
-    // 22. Inline hook: strlen — with hub auto-recursion prevention
-    // Hub ensures: when proxy internally triggers strlen (via result_pass → g_result +=),
-    // the recursive call goes to the original function, not the proxy again.
-    g_result += "\n--- Inline hook: strlen (hub) ---\n";
+    // 22. Inline hook: strlen — user hooks strlen, framework auto-detects FORTIFY
+    // Framework automatically hooks __strlen_chk, orig points to raw strlen
+    g_result += "\n--- Inline hook: strlen (FORTIFY auto) ---\n";
     {
         typedef size_t (*strlen_fn)(const char *);
         static strlen_fn orig_strlen_fn = NULL;
 
+        static volatile int strlen_call_count;
+        strlen_call_count = 0;
+
         struct strlen_hook {
             static size_t hooked_strlen(const char *s) {
-                // No guard needed — hub handles recursion automatically!
-                return orig_strlen_fn(s) + 42;
+                // Observe only — do NOT modify return value for global functions!
+                // Modifying return value of strlen/memcpy/etc breaks other threads.
+                strlen_call_count++;
+                return orig_strlen_fn(s);  // transparent pass-through
             }
         };
 
@@ -848,23 +852,30 @@ static void adl_test() {
                                       reinterpret_cast<void *>(strlen_hook::hooked_strlen),
                                       reinterpret_cast<void **>(&orig_strlen_fn));
             if (ret == 0) {
-                result_pass("adl_inline_hook(strlen) installed at %p", target);
+                result_pass("adl_inline_hook(strlen) installed");
 
+                // Verify interception: call strlen and check counter
+                strlen_call_count = 0;
                 char test[] = "hello";
-                volatile size_t hooked_len = strlen(test);
-                if (hooked_len == 5 + 42) {
-                    result_pass("hooked: strlen(\"hello\") = %zu (+42)", (size_t)hooked_len);
+                volatile size_t len = strlen(test);
+                if (strlen_call_count > 0 && len == 5) {
+                    result_pass("hooked: strlen(\"hello\") = %zu, intercepted %d times",
+                                (size_t)len, (int)strlen_call_count);
                 } else {
-                    result_fail("hooked: strlen(\"hello\") = %zu, expected 47", (size_t)hooked_len);
+                    result_fail("hooked: strlen count=%d len=%zu",
+                                (int)strlen_call_count, (size_t)len);
                 }
 
                 adl_inline_unhook(target);
                 result_pass("adl_inline_unhook(strlen) restored");
+                strlen_call_count = 0;
                 volatile size_t restored = strlen(test);
-                if (restored == 5) {
-                    result_pass("unhooked: strlen(\"hello\") = %zu (correct)", (size_t)restored);
+                if (strlen_call_count == 0 && restored == 5) {
+                    result_pass("unhooked: strlen not intercepted, len=%zu (correct)",
+                                (size_t)restored);
                 } else {
-                    result_fail("unhooked: strlen(\"hello\") = %zu, expected 5", (size_t)restored);
+                    result_fail("unhooked: count=%d len=%zu",
+                                (int)strlen_call_count, (size_t)restored);
                 }
             } else {
                 result_fail("adl_inline_hook(strlen) failed");

@@ -1,7 +1,8 @@
 cmake_minimum_required(VERSION 3.10.2)
 add_compile_options(-std=c++14)
 
-file(GLOB HOOKER_SRC *.cpp)
+file(GLOB HOOKER_SRC *.cpp *.S)
+enable_language(ASM)
 
 # Import andlinker
 set(ADL_BASE ${CMAKE_CURRENT_SOURCE_DIR}/../../../../andlinker)
